@@ -37,7 +37,8 @@ const Sidebar = () => {
     (state) => state.global.isSidebarCollapsed,
   );
 
-  const { data: currentUser } = useGetAuthUserQuery({});
+  // const { data: currentUser } = useGetAuthUserQuery({});
+  const { data: currentUser } = useGetAuthUserQuery();
   const handleSignOut = async () => {
     try {
       await signOut();

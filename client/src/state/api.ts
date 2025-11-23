@@ -1,4 +1,4 @@
-import { createApi, fetchBaseQuery, BaseQueryApi } from "@reduxjs/toolkit/query/react";
+import { createApi, fetchBaseQuery, BaseQueryApi, FetchBaseQueryError } from "@reduxjs/toolkit/query/react";
 
 // ⚠️ TEMPORARY MOCK FOR AWS-AMPLIFY/AUTH
 // These mock functions replace the real imports for temporary development.
@@ -137,25 +137,43 @@ export const api = createApi({
   tagTypes: ["Projects", "Tasks", "Users", "Teams", "EPLFixtures", "EPLStandings", "EPLChecks", "QcResults"],
   endpoints: (build) => ({
     getAuthUser: build.query<AuthUserResponse, void>({
-      queryFn: async (_, _queryApi, _extraoptions, fetchWithBQ) => {
-        try {
-          const user = await getCurrentUser();
-          const session = await fetchAuthSession();
-          
-          if (!session) throw new Error("No session found");
-          const { userSub } = session;
+    // Arguments are correctly defined here to satisfy the signature
+      queryFn: async (arg, api: BaseQueryApi, extraOptions: {}, baseQuery) => {
+          try {
+              const user = await getCurrentUser();
+              const session = await fetchAuthSession();
+              
+              if (!session) throw new Error("No session found");
+              const { userSub } = session;
 
-          // fetchWithBQ will use the mock token in the header
-          const userDetailsResponse = await fetchWithBQ(`dashboard/users/${userSub}`);
-          const userDetails = userDetailsResponse.data as User;
+              // Fetch user details from the backend (This is the slow/failing part in a mock setup)
+              const userDetailsResponse = await baseQuery(`dashboard/users/${userSub}`);
+              
+              if (userDetailsResponse.error) {
+                  // If the internal fetch failed, return its error structure directly.
+                  return { error: userDetailsResponse.error }; 
+              }
 
-          return { data: { user, userSub, userDetails } };
-        } catch (error: any) {
-          return { error: error.message || "Could not fetch user data" };
-        }
+              const userDetails = userDetailsResponse.data as User;
+
+              // Return the full successful data structure
+              return { data: { user, userSub, userDetails } };
+          } 
+          catch (error: any) {
+              // CRITICAL FIX: Return a minimal error structure that conforms to FetchBaseQueryError, 
+              // ensuring the status is numeric or a standard string.
+              console.error("Auth User Query Failed:", error.message);
+              return { 
+                  error: {
+                      status: 400, // Use a standard HTTP error status for simplicity
+                      data: { message: error.message || "User data fetch failed." },
+                      // Ensure the error type is satisfied if using specific unions
+                  } as FetchBaseQueryError
+              };
+          }
       },
       providesTags: ["Users"], 
-    }),
+  }),
     
     getProjects: build.query<Project[], void>({
       query: () => "/dashboard/projects/",
