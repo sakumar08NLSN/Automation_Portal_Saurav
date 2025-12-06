@@ -1,7 +1,7 @@
-client/node_modules
+frontend/node_modules
 server/node_modules
-client/dist/
+frontend/dist/
 server/dist/
-client/.env
+frontend/.env
 server/.env
-client/.next/
+frontend/.next/

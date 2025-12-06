@@ -1,0 +1,45 @@
+{
+  "name": "FastAPI Development",
+  // Base image provides Python 3.11 on Debian Bookworm
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.11-bookworm",
+
+  "customizations": {
+    "codespaces": {
+      "openFiles": [
+        "README.md",
+        "frontend.py" // Changed to open your frontend file
+      ]
+    },
+    "vscode": {
+      "settings": {},
+      "extensions": [
+        "ms-python.python",      
+        "ms-python.vscode-pylance", 
+        "ms-toolsai.jupyter"     
+      ]
+    }
+  },
+
+  // Ensures FastAPI and Uvicorn are installed
+  "updateContentCommand": "[ -f packages.txt ] && sudo apt update && sudo apt upgrade -y && sudo xargs apt install -y <packages.txt; [ -f requirements.txt ] && pip3 install --user -r requirements.txt; pip3 install --user fastapi uvicorn",
+  
+  // *** KEY CHANGE: POST ATTACH COMMAND ***
+  // This command starts the FastAPI server looking for the 'app' variable in 'api.py'.
+  // NOTE: You typed '--hos' in your prompt, I've corrected it to '--host'.
+  "postAttachCommand": {
+    "server": "uvicorn main:master_app --host 0.0.0.0 --port 8000 --reload"
+  },
+  
+  // Attributes for port 8000 (FastAPI default)
+  "portsAttributes": {
+    "8000": {
+      "label": "FastAPI Application",
+      "onAutoForward": "openBrowser" 
+    }
+  },
+  
+  // Ensures port 8000 is forwarded
+  "forwardPorts": [
+    8000
+  ]
+}
