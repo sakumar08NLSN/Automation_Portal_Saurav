@@ -138,7 +138,20 @@ DUMMY_ATTACHMENTS: List[Attachment] = [
 
 # --- DUMMY_TASKS (Complete 40 records) ---
 DUMMY_TASKS: List[Task] = [
-    Task.model_validate({"id": 1, "title": "Task 1", "description": "Design the main module.", "status": "Work In Progress", "priority": "Urgent", "tags": "Design", "startDate": "2023-01-10T00:00:00Z", "dueDate": "2023-04-10T00:00:00Z", "points": 5, "projectId": 1, "authorUserId": 1, "assignedUserId": 2}),
+    # Task.model_validate({"id": 1, "title": "Task 1", "description": "Design the main module.", "status": "Work In Progress", "priority": "Urgent", "tags": "Design", "startDate": "2023-01-10T00:00:00Z", "dueDate": "2023-04-10T00:00:00Z", "points": 5, "projectId": 1, "authorUserId": 1, "assignedUserId": 2}),
+    Task.model_validate({
+  "id": 1,
+  "title": "Match Data Accuracy Check",
+  "description": "Verify player performance metrics and cross-validate match statistics with official sources.",
+  "status": "Work In Progress",
+  "priority": "Urgent",
+  "tags": "Quality Check",
+  "startDate": "2023-01-10T00:00:00Z",
+  "dueDate": "2023-04-10T00:00:00Z",
+  "projectId": 1,
+  "authorUserId": 1,
+  "assignedUserId": 2
+}),
     Task.model_validate({"id": 2, "title": "Task 2", "description": "Implement the navigation algorithm.", "status": "To Do", "priority": "High", "tags": "Coding", "startDate": "2023-01-15T00:00:00Z", "dueDate": "2023-05-15T00:00:00Z", "points": 8, "projectId": 2, "authorUserId": 3, "assignedUserId": 4}),
     Task.model_validate({"id": 3, "title": "Task 3", "description": "Develop renewable energy solutions.", "status": "Work In Progress", "priority": "Urgent", "tags": "Development", "startDate": "2023-03-20T00:00:00Z", "dueDate": "2023-09-20T00:00:00Z", "points": 13, "projectId": 3, "authorUserId": 5, "assignedUserId": 6}),
     Task.model_validate({"id": 4, "title": "Task 4", "description": "Outline new software development workflows.", "status": "To Do", "priority": "High", "tags": "Planning", "startDate": "2023-01-25T00:00:00Z", "dueDate": "2023-06-25T00:00:00Z", "points": 2, "projectId": 4, "authorUserId": 7, "assignedUserId": 8}),

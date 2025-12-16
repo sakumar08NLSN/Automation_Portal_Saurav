@@ -5,3 +5,8 @@ server/dist/
 frontend/.env
 server/.env
 frontend/.next/
+
+venv/
+src/saas_backend/venv/
+__pycache__/
+*.pyc
