@@ -1,6 +1,6 @@
 # DASHBOARD_BACKEND/app/dashboard_routes.py
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 import os
 
 # Import your existing route files
@@ -11,8 +11,13 @@ from app.routes import user_routes
 from app.routes import team_routes
 from app.routes import upload_routes
 
+from app.auth import verify_okta_token
+
 # Create the master router for the dashboard endpoints
-dashboard_router = APIRouter(prefix="/dashboard") # Optional: Add a common prefix if needed
+dashboard_router = APIRouter(
+    prefix="/dashboard",
+    dependencies=[Depends(verify_okta_token)]
+) # Optional: Add a common prefix if needed
 
 # --- ROUTES ---
 

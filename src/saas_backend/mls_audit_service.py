@@ -23,18 +23,34 @@ def get_numeric_serial_vectorized(df, date_col, time_col):
     except Exception as e:
         return np.nan
 
+def get_regional_fixtures(file_path):
+    """Scans the USA/Canada raw files and extracts all Fixture names for National Checks."""
+    try:
+        xl = pd.ExcelFile(file_path, engine='calamine')
+        df = pd.read_excel(xl, sheet_name=0, skiprows=5)
+        xl.close()
+        
+        fix_col = next((c for c in df.columns if 'Fixture' in str(c) or 'Episode Desc' in str(c)), None)
+        if fix_col:
+            return set(df[fix_col].dropna().astype(str).str.strip())
+    except Exception:
+        pass
+    return set()
+
 def prep_regional_data(file_path):
-    """Extracts Data, applies dynamic 20-min rolling simulcast/spillover logic, and targets Nielsen Audience."""
+    """Extracts Data, applies dynamic 20-min rolling simulcast/spillover logic, and prepares for matching."""
     logs = []
     xl = pd.ExcelFile(file_path, engine='calamine')
     df_raw = pd.read_excel(xl, sheet_name=0, skiprows=5)
     xl.close()
 
-    # Safely locate all required columns dynamically
     col_chan = next((c for c in df_raw.columns if 'TV-Channel' in str(c)), df_raw.columns[4])
     col_date = next((c for c in df_raw.columns if c == 'Date'), df_raw.columns[8])
+    
+    # TIP: If your MLS data is in UTC time, change 'Start' below to 'Start (UTC)' to fix time mismatches!
     col_time = next((c for c in df_raw.columns if c == 'Start'), df_raw.columns[12])
     col_end = next((c for c in df_raw.columns if c == 'End'), df_raw.columns[13])
+    
     col_broadcaster = next((c for c in df_raw.columns if 'Broadcaster' in str(c)), df_raw.columns[3])
     col_title = next((c for c in df_raw.columns if 'Program Title' in str(c)), df_raw.columns[15])
     
@@ -44,7 +60,6 @@ def prep_regional_data(file_path):
 
     clean_aud_strings = df_raw[col_aud].astype(str).str.replace(',', '.').str.replace(r'[^\d.]', '', regex=True)
 
-    # Build initial dataframe
     df_clean = pd.DataFrame({
         'broadcaster': df_raw[col_broadcaster].astype(str).str.strip().str.upper(),
         'title': df_raw[col_title].astype(str).str.strip().str.upper(),
@@ -52,48 +67,39 @@ def prep_regional_data(file_path):
         '_regional_aud': pd.to_numeric(clean_aud_strings, errors='coerce').fillna(0.0)
     })
 
-    # Create precise datetime objects to calculate the 20-minute gaps
-    df_clean['start_dt'] = pd.to_datetime(df_raw[col_date].astype(str) + ' ' + df_raw[col_time].astype(str), dayfirst=True, errors='coerce')
-    df_clean['end_dt'] = pd.to_datetime(df_raw[col_date].astype(str) + ' ' + df_raw[col_end].astype(str), dayfirst=True, errors='coerce')
-    df_clean = df_clean.dropna(subset=['start_dt', 'end_dt'])
+    df_clean['_calc_serial'] = get_numeric_serial_vectorized(df_raw, col_date, col_time)
+    df_clean = df_clean.dropna(subset=['_calc_serial'])
 
-    # Fix Midnight Crossover (if a broadcast ends after midnight, its end_dt is technically the next day)
+    base_date = pd.Timestamp('1899-12-30')
+    df_clean['start_dt'] = base_date + pd.to_timedelta(df_clean['_calc_serial'], unit='D')
+
+    time_srs_end = df_raw[col_end].copy().astype(str).str.replace(r'.*1899-12-30\s+', '', regex=True)
+    end_td = pd.to_timedelta(time_srs_end, errors='coerce')
+    df_clean['end_dt'] = base_date + pd.to_timedelta((df_clean['start_dt'] - base_date).dt.days, unit='D') + end_td
+    
+    df_clean['end_dt'] = df_clean['end_dt'].fillna(df_clean['start_dt'] + pd.Timedelta(hours=2))
+
     cross_midnight = df_clean['end_dt'] < df_clean['start_dt']
     df_clean.loc[cross_midnight, 'end_dt'] += pd.Timedelta(days=1)
 
-    # --- DYNAMIC SIMULCAST & SPILLOVER ENGINE ---
-    # 1. Sort by Broadcaster, Title, Start Time, and Channel Name.
-    # Sorting alphabetically by Channel Name ensures the "Main" English network (like ESPN) 
-    # comes before its sub-network (like ESPN DEPORTES), becoming the primary match label.
-    df_clean = df_clean.sort_values(['broadcaster', 'title', 'start_dt', '_join_chan'])
+    # --- SAFEST DYNAMIC SIMULCAST & SPILLOVER ENGINE ---
+    df_clean = df_clean.sort_values(['broadcaster', 'title', 'start_dt'])
 
-    # 2. Look at the end time of the previous row for the same broadcaster & title
     df_clean['prev_end'] = df_clean.groupby(['broadcaster', 'title'])['end_dt'].shift(1)
-
-    # 3. Check if the current broadcast starts more than 20 mins after the previous one ended
-    # If it starts within 20 minutes (or simultaneously), it belongs to the same broadcast session.
     df_clean['is_new_session'] = (df_clean['start_dt'] > (df_clean['prev_end'] + pd.Timedelta(minutes=20)))
-    df_clean['is_new_session'] = df_clean['is_new_session'].fillna(True) # First row is always a new session
-
-    # 4. Group the connected broadcasts together using a cumulative sum
+    df_clean['is_new_session'] = df_clean['is_new_session'].fillna(True)
     df_clean['session_id'] = df_clean.groupby(['broadcaster', 'title'])['is_new_session'].cumsum()
 
-    # 5. Aggregate! Sum the audiences, keep the earliest start time, and keep the primary channel name
-    df_grouped = df_clean.groupby(['broadcaster', 'title', 'session_id'], as_index=False).agg({
-        'start_dt': 'min',
-        '_join_chan': 'first',
-        '_regional_aud': 'sum'
-    })
-    # --------------------------------------------
+    session_totals = df_clean.groupby(['broadcaster', 'title', 'session_id'])['_regional_aud'].sum().reset_index(name='session_total_aud')
 
-    # Convert the start_dt back to Excel serial format for the main engine merge
-    base_date = pd.Timestamp('1899-12-30')
-    df_grouped['_calc_serial'] = ((df_grouped['start_dt'] - base_date).dt.total_seconds() / 86400.0).round(4)
-    df_grouped = df_grouped.sort_values('_calc_serial')
+    df_clean = df_clean.merge(session_totals, on=['broadcaster', 'title', 'session_id'])
+    df_clean['_regional_aud'] = df_clean['session_total_aud']
+
+    df_clean = df_clean.sort_values('_calc_serial')
     
-    del df_raw, df_clean
+    del df_raw
     gc.collect()
-    return df_grouped, logs
+    return df_clean, logs
 
 # --- Main Processor ---
 async def process_mls_audit_logic_stream(mls_data, usa_data, canada_data, upload_folder):
@@ -116,13 +122,18 @@ async def process_mls_audit_logic_stream(mls_data, usa_data, canada_data, upload
             with open(usa_p, "wb") as f: shutil.copyfileobj(usa_data.file, f)
         if canada_data:
             with open(can_p, "wb") as f: shutil.copyfileobj(canada_data.file, f)
-        yield "data: [LOG] Step 1/6: Files safely buffered to disk.\n\n"
+        yield "data: [LOG] Step 1/5: Files safely buffered to disk.\n\n"
     except Exception as e:
         yield f"data: [ERROR] Disk Write Failure: {str(e)}\n\n"
         return
 
-    # 2. Load MLS Data & Required Tabs
-    yield "data: [LOG] Step 2/6: Loading core MLS Data & calculating base columns...\n\n"
+    # 2. Extract Fixtures for US/CAN Checks
+    yield "data: [LOG] Step 2/5: Verifying Fixtures in USA & Canada files...\n\n"
+    usa_fixtures = get_regional_fixtures(usa_p) if usa_p else set()
+    can_fixtures = get_regional_fixtures(can_p) if can_p else set()
+
+    # 3. Load MLS Data & Base Columns
+    yield "data: [LOG] Step 3/5: Loading core MLS Data & calculating base columns...\n\n"
     try:
         xl_mls = pd.ExcelFile(mls_p, engine='calamine')
         
@@ -132,9 +143,6 @@ async def process_mls_audit_logic_stream(mls_data, usa_data, canada_data, upload
         sched_sheet = next((s for s in xl_mls.sheet_names if "schedule" in s.lower()), None)
         df_sched = pd.read_excel(xl_mls, sheet_name=sched_sheet) if sched_sheet else pd.DataFrame()
         
-        nat_sheet = next((s for s in xl_mls.sheet_names if "national" in s.lower() and "ca" in s.lower()), None)
-        df_nat = pd.read_excel(xl_mls, sheet_name=nat_sheet) if nat_sheet else pd.DataFrame()
-
         multi_sheet = next((s for s in xl_mls.sheet_names if "multi" in s.lower() and "rate" in s.lower()), None)
         df_multi = pd.read_excel(xl_mls, sheet_name=multi_sheet) if multi_sheet else pd.DataFrame()
         
@@ -144,20 +152,13 @@ async def process_mls_audit_logic_stream(mls_data, usa_data, canada_data, upload
         df_mls['_calc_serial'] = pd.to_numeric(df_mls['_calc_serial'], errors='coerce').fillna(0)
         df_mls['_join_chan'] = df_mls['channel'].astype(str).str.strip().str.upper()
         
-        # --- NEW FEATURE: REGIONAL AFFILIATE MAPPING ---
-        # 1. Define your list of keywords here
+        # --- REGIONAL AFFILIATE MAPPING ---
         affiliate_keywords = ['WFXT', 'KTVU', 'KTTV', 'WNYW'] 
-        
-        # 2. Define exactly what the USA file calls the Fox National channel
-        fox_national_name = 'FOX BROADCASTING COMPANY' # Update this to match your USA file!
+        fox_national_name = 'FOX BROADCASTING COMPANY' 
 
-        # 3. Extract the text inside the parentheses
         bracket_contents = df_mls['_join_chan'].str.extract(r'\((.*?)\)')[0].fillna('')
-
-        # 4. If the extracted text is in your list, rename it to the national channel
         is_affiliate = bracket_contents.isin(affiliate_keywords)
         df_mls.loc[is_affiliate, '_join_chan'] = fox_national_name
-        # ----------------------------------------------
         
         df_mls['_original_idx'] = df_mls.index
         
@@ -175,8 +176,8 @@ async def process_mls_audit_logic_stream(mls_data, usa_data, canada_data, upload
         yield f"data: [ERROR] Failed to process MLS file: {str(e)}\n\n"
         return
 
-    # 3. Load Regional Data & Merge (Audience Logic)
-    yield "data: [LOG] Step 3/6: Running cross-region audience lookups...\n\n"
+    # 4. Audience Lookups (The Heavy Lifting Engine)
+    yield "data: [LOG] Step 4/5: Running dynamic cross-region audience lookups...\n\n"
     
     if usa_p:
         df_usa, usa_logs = prep_regional_data(usa_p)
@@ -184,25 +185,19 @@ async def process_mls_audit_logic_stream(mls_data, usa_data, canada_data, upload
         mls_usa_subset = df_mls[usa_mask].sort_values('_calc_serial')
 
         if not mls_usa_subset.empty and not df_usa.empty:
-            # --- NEW FEATURE: Separate Regional FOX from Standard Channels ---
-            # Finds channels with "FOX" but excludes explicit "SPORTS" or "DEPORTES" to catch affiliates
             reg_fox_mask = mls_usa_subset['_join_chan'].str.contains('FOX') & ~mls_usa_subset['_join_chan'].str.contains('SPORTS|DEPORTES')
             
             mls_std = mls_usa_subset[~reg_fox_mask]
             mls_fox = mls_usa_subset[reg_fox_mask]
 
-            # 1. Standard Matching (Requires Exact Channel Name & Time)
             if not mls_std.empty:
                 merged_std = pd.merge_asof(mls_std, df_usa, on='_calc_serial', by='_join_chan', direction='nearest', tolerance=0.042)
                 matched_std = merged_std.dropna(subset=['_regional_aud'])
                 df_mls.loc[matched_std['_original_idx'].values, 'Audiences (000)'] = matched_std['_regional_aud'].values
 
-            # 2. Regional FOX Fallback Matching (Requires Only Time match against FS1/FS2)
             if not mls_fox.empty:
-                # Isolate only FS1 and FS2 from the USA file
                 fs_usa_data = df_usa[df_usa['_join_chan'].isin(['FOX SPORTS 1 USA', 'FOX SPORTS 2 USA'])].sort_values('_calc_serial')
                 if not fs_usa_data.empty:
-                    # Notice we drop "by='_join_chan'". It purely grabs whichever FS1/FS2 broadcast is at the same time!
                     merged_fox = pd.merge_asof(mls_fox, fs_usa_data, on='_calc_serial', direction='nearest', tolerance=0.042)
                     matched_fox = merged_fox.dropna(subset=['_regional_aud'])
                     df_mls.loc[matched_fox['_original_idx'].values, 'Audiences (000)'] = matched_fox['_regional_aud'].values
@@ -220,16 +215,18 @@ async def process_mls_audit_logic_stream(mls_data, usa_data, canada_data, upload
         del df_can
         gc.collect()
 
-    # 4. Process Complex Lookups (Rates, Checks, QC, Simulcasts)
-    yield "data: [LOG] Step 4/6: Calculating Rates, Checks, and QC...\n\n"
+    # 5. Process Lookups (Rates, Checks, QC, Simulcasts)
+    yield "data: [LOG] Step 5/5: Calculating Rates, Checks, and Formatting Output...\n\n"
     if not df_sched.empty and 'Fixture' in df_mls.columns:
         try:
+            # Extract Col A(0), M(12), N(13), AD(29), AF(31), AH(33) for financial calculations
             df_sched_subset = df_sched.iloc[:, [0, 12, 13, 29, 31, 33]].copy()
             df_sched_subset.columns = ['Fixture', 'val_M', 'val_N', 'val_AD', 'val_AF', 'val_AH']
             df_sched_subset.drop_duplicates(subset=['Fixture'], inplace=True)
             
             df_mls = df_mls.merge(df_sched_subset, on='Fixture', how='left')
 
+            # --- Financial Rates ---
             cond_apple = df_mls['channel'].astype(str).str.strip().isin(['Apple TV+ US (www)', 'Apple TV+ (www)'])
             cond_usa_mls = (df_mls['programme'].astype(str).str.strip() == 'MLS Live') & (df_mls['channel country'].astype(str).str.strip().str.upper() == 'USA')
             cond_can_mls = (df_mls['programme'].astype(str).str.strip() == 'MLS Live') & (df_mls['channel country'].astype(str).str.strip().str.upper() == 'CANADA')
@@ -244,19 +241,19 @@ async def process_mls_audit_logic_stream(mls_data, usa_data, canada_data, upload
                 default=0.0
             ).round(2)
 
-            nat_keys = set(df_nat.iloc[:, 2].astype(str).str.strip()) if not df_nat.empty else set()
-            
+            # --- US and CAN National Checks (Searching the raw files directly) ---
             val_m_blank = df_mls['val_M'].isna() | (df_mls['val_M'].astype(str).str.strip() == "")
             val_n_blank = df_mls['val_N'].isna() | (df_mls['val_N'].astype(str).str.strip() == "")
             
-            is_in_nat_us = (df_mls['Fixture'].astype(str) + "US").isin(nat_keys)
-            is_in_nat_can = (df_mls['Fixture'].astype(str) + "CAN").isin(nat_keys)
+            is_in_usa = df_mls['Fixture'].astype(str).str.strip().isin(usa_fixtures)
+            is_in_can = df_mls['Fixture'].astype(str).str.strip().isin(can_fixtures)
 
-            df_mls['US National Check'] = np.select([val_m_blank, is_in_nat_us], ["OKAY", True], default=False)
-            df_mls['CAN Check'] = np.select([val_n_blank, is_in_nat_can], ["OKAY", True], default=False)
+            df_mls['US National Check'] = np.select([val_m_blank, is_in_usa], ["OKAY", True], default=False)
+            df_mls['CAN Check'] = np.select([val_n_blank, is_in_can], ["OKAY", True], default=False)
 
             df_mls['All Feeds Ready?'] = np.where((df_mls['US National Check'] != False) & (df_mls['CAN Check'] != False), "Yes", "No")
 
+            # --- QC Logic ---
             df_mls['is_apple'] = df_mls['channel'].astype(str).str.contains('Apple TV', case=False, na=False)
             fixture_stats = df_mls.groupby('Fixture').agg(apple_cnt=('is_apple', 'sum'), total_cnt=('is_apple', 'count')).reset_index()
             df_mls = df_mls.merge(fixture_stats, on='Fixture', how='left')
@@ -274,28 +271,22 @@ async def process_mls_audit_logic_stream(mls_data, usa_data, canada_data, upload
                 default=""
             )
 
+            # --- Simulcasts ---
             multi_keys = set(df_multi.iloc[:, 0].astype(str).str.strip()) if not df_multi.empty else set()
-            
-            df_mls['Simulcasts'] = np.where(
-                df_mls['QC'] != "", 
-                np.where(df_mls['Fixture'].astype(str).str.strip().isin(multi_keys), "Added", "Still Missing"), 
-                ""
-            )
+            df_mls['Simulcasts'] = np.where(df_mls['QC'] != "", np.where(df_mls['Fixture'].astype(str).str.strip().isin(multi_keys), "Added", "Still Missing"), "")
 
         except IndexError:
             yield "data: [WARNING] Schedule tab doesn't have enough columns for mappings.\n\n"
 
-    # 5. Final Data Adjustments
-    yield "data: [LOG] Step 5/6: Applying platform overrides...\n\n"
-    
+    # --- Final Data Adjustments & Formatting ---
     df_mls['Audiences (000)'] = pd.to_numeric(df_mls['Audiences (000)'], errors='coerce').fillna(0.0)
-    df_mls['Audiences (000)'] = df_mls['Audiences (000)'].apply(lambda x: f"{x:.3f}")
+    
+    # Format to exactly 3 decimal places (except 0)
+    df_mls['Audiences (000)'] = df_mls['Audiences (000)'].apply(lambda x: f"{x:.3f}" if x != 0.0 else 0)
     
     apple_tv_mask = df_mls['channel'].astype(str).str.contains('Apple TV', case=False, na=False)
     df_mls.loc[apple_tv_mask, 'Audiences (000)'] = "Streaming Channel"
 
-    # 6. Generate Output
-    yield "data: [LOG] Step 6/6: Generating final Excel buffer...\n\n"
     output = io.BytesIO()
     
     cols_to_drop = ['_calc_serial', '_join_chan', '_original_idx', 'val_M', 'val_N', 'val_AD', 'val_AF', 'val_AH', 'is_apple', 'apple_cnt', 'total_cnt']

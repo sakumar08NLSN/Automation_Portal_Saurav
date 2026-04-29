@@ -435,6 +435,34 @@ import {
 } from "lucide-react";
 
 // --- METRIC & DATA CONFIG ---
+const WHATS_NEW_DATA = [
+  {
+    version: "v1.1",
+    date: "April 2026",
+    changes: {
+      "New Features": ["Added Laliga QC module", "Added F1 Market checks"],
+      "Improvements": ["Improved file upload stability"],
+      "QC Logic Updates": ["Improved program category classification"]
+    }
+  },
+  {
+    version: "v1.0",
+    date: "March 2026",
+    changes: {
+      "New Features": ["Initial QC Automation release", "Main QC checks implemented"],
+      "Improvements": ["Basic validation engine"]
+    }
+  },
+  {
+    version: "v0.9",
+    date: "February 2026",
+    changes: {
+      "New Features": ["Internal beta release"],
+      "Bug Fixes": ["Minor stability fixes"]
+    }
+  }
+];
+
 const primaryMetric = { 
   title: "Current Potential Monthly Savings", 
   value: "500h+", 
@@ -491,6 +519,8 @@ const deployments = [
 
 const HomePage = () => {
   const [openFeedback, setOpenFeedback] = useState(false);
+  const [openUpdates, setOpenUpdates] = useState(false);
+  const [openRequirement, setOpenRequirement] = useState(false);
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] dark:bg-[#050505] text-slate-900 dark:text-slate-100 font-sans relative">
@@ -596,14 +626,39 @@ const HomePage = () => {
         </div>
       </main>
 
-      {/* --- GOOGLE FORM LOGIC MOVED HERE --- */}
-      <button
-        onClick={() => setOpenFeedback(true)}
-        className="fixed bottom-6 right-6 bg-blue-600 text-white px-4 py-2 rounded-lg shadow-lg hover:bg-blue-700 z-50 transition-colors"
-      >
-        Feedback
-      </button>
+      {/* --- FLOATING ACTION BUTTONS --- */}
+      <div className="fixed bottom-6 right-6 flex flex-col items-end gap-3 z-50">
+        
+        {/* NEW UPDATES BUTTON */}
+        <button
+          onClick={() => setOpenUpdates(true)}
+          className="bg-gradient-to-r from-indigo-600 to-purple-600 text-white px-4 py-2 rounded-lg shadow-lg hover:scale-105 transition font-bold text-sm"
+        >
+          🚀 New Updates
+        </button>
 
+        <div className="flex gap-3">
+          {/* NEW BUSINESS REQUIREMENT BUTTON */}
+          <button
+            onClick={() => setOpenRequirement(true)}
+            className="bg-blue-600 text-white px-4 py-2 rounded-lg shadow-lg hover:bg-blue-700 transition-colors text-sm font-medium"
+          >
+            New Business Requirement
+          </button>
+
+          {/* FEEDBACK BUTTON */}
+          <button
+            onClick={() => setOpenFeedback(true)}
+            className="bg-blue-800 text-white px-4 py-2 rounded-lg shadow-lg hover:bg-blue-900 transition-colors text-sm font-medium"
+          >
+            Feedback
+          </button>
+        </div>
+      </div>
+
+      {/* --- MODALS --- */}
+
+      {/* FEEDBACK MODAL */}
       {openFeedback && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-[60] p-4">
           <div className="bg-white rounded-lg w-full max-w-[750px] h-[80vh] relative shadow-2xl overflow-hidden">
@@ -621,6 +676,88 @@ const HomePage = () => {
             >
               Loading…
             </iframe>
+          </div>
+        </div>
+      )}
+
+      {/* BUSINESS REQUIREMENT MODAL */}
+      {openRequirement && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-[60] p-4">
+          <div className="bg-white rounded-lg w-full max-w-[750px] h-[80vh] relative shadow-2xl overflow-hidden">
+            <button
+              onClick={() => setOpenRequirement(false)}
+              className="absolute top-3 right-4 text-slate-500 hover:text-black text-2xl z-10"
+            >
+              ✕
+            </button>
+            <iframe
+              src="https://docs.google.com/forms/d/e/1FAIpQLSfa4wtaZxSsYbxG8oBQC1EPdYDEGcZlkiwBkZyhLUkKUOfkfA/viewform?embedded=true"
+              width="100%"
+              height="100%"
+              className="border-none"
+            >
+              Loading…
+            </iframe>
+          </div>
+        </div>
+      )}
+
+      {/* NEW UPDATES MODAL */}
+      {openUpdates && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[70] p-4">
+          <div className="bg-white dark:bg-[#0F131F] w-full max-w-5xl max-h-[85vh] rounded-xl shadow-2xl overflow-hidden border border-slate-200 dark:border-slate-800 flex flex-col">
+            <div className="flex justify-between items-center px-6 py-4 border-b border-slate-200 dark:border-slate-800">
+              <div>
+                <h2 className="text-lg font-bold">🆕 What&apos;s New</h2>
+                <p className="text-xs text-slate-500">Latest updates</p>
+              </div>
+              <button
+                onClick={() => setOpenUpdates(false)}
+                className="text-xl text-slate-400 hover:text-black dark:hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="p-6 overflow-y-auto space-y-6">
+              {(() => {
+                const latest = WHATS_NEW_DATA[0];
+                return (
+                  <div>
+                    <div className="mb-4 px-4 py-2 rounded-lg bg-gradient-to-r from-indigo-600 to-purple-600 text-white text-sm font-semibold">
+                      🚀 Latest: {latest.version} – {latest.date}
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      {Object.entries(latest.changes).map(([key, items], i) => (
+                        <div key={i} className="bg-slate-50 dark:bg-slate-800/40 p-4 rounded-lg border border-slate-200 dark:border-slate-700">
+                          <h3 className="text-xs font-bold mb-2 text-indigo-500">{key}</h3>
+                          <ul className="text-xs space-y-1">
+                            {(items as string[]).map((item, idx) => (
+                              <li key={idx}>• {item}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
+              <div>
+                <h3 className="text-sm font-bold mb-3">Previous Versions</h3>
+                {WHATS_NEW_DATA.slice(1).map((v, i) => (
+                  <div key={i} className="p-3 mb-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/30">
+                    <h4 className="text-xs font-bold mb-1">
+                      {v.version} – {v.date}
+                    </h4>
+                    {Object.entries(v.changes).map(([key, items], idx) => (
+                      <div key={idx} className="text-xs">
+                        <span className="font-semibold">{key}: </span>
+                        {(items as string[]).join(", ")}
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
       )}

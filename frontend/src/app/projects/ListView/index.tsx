@@ -765,7 +765,8 @@ import React, { useState, useEffect } from "react";
 import { 
   UploadCloud, CheckCircle, AlertTriangle, FileText, 
   Loader, Download, ShieldCheck, Database, Zap, FileSpreadsheet,
-  Activity, Settings2, CheckSquare, PanelLeftClose, PanelLeftOpen, X
+  Activity, Settings2, CheckSquare, PanelLeftClose, PanelLeftOpen, X,
+  Hash, CalendarDays // Added new icons for inputs
 } from "lucide-react";
 import { useAppSelector } from "@/app/redux"; 
 import { dataGridClassNames, dataGridSxStyles } from "@/lib/utils"; 
@@ -775,6 +776,7 @@ import {
   useRunQcChecksMutation, 
   useRunMarketChecksMutation, 
   useGetProjectsQuery, 
+  useGetAuthUserQuery, // 🎯 Added to track who runs the checks
   QcRunResponse 
 } from "@/state/api";
 import Image from "next/image";
@@ -793,15 +795,9 @@ const defaultChecks = [
 ];
 
 const footballChecks = [
-  
   { key: "impute_lt_live_status", name: "L/T Keyword Live Override", type: "EPL", description: "Flags missing 'Live' status despite the presence of the 'L/T' tag." },
   { key: "consolidate_gillete_soccer", name: "Gillette Soccer Consolidation", type: "EPL", description: "Flags short, sequential 'Gillete Soccer' entries that should be combined." },
-  { 
-    key: "consolidate_soccer_sunday", 
-    name: "Soccer Sunday Consolidation", 
-    type: "EPL", 
-    description: "Flags sequential 'Soccer Sunday' programs in UK/Ireland with gaps ≤ 30 mins." 
-  },
+  { key: "consolidate_soccer_sunday", name: "Soccer Sunday Consolidation", type: "EPL", description: "Flags sequential 'Soccer Sunday' programs in UK/Ireland with gaps ≤ 30 mins." },
   { key: "check_sky_showcase_live", name: "Sky Showcase (UK) Repeat Check", type: "EPL", description: "Flags any program incorrectly marked as 'Live' on Sky Showcase (UK)." },
   { key: "standardize_uk_ire_region", name: "UK/Europe Region Correction", type: "EPL", description: "Flags any non-'Europe' region name for UK/Ireland data." },
   { key: "check_fixture_vs_case", name: "VS Case Sensitivity", type: "EPL", description: "Flags fixture names using uppercase/mixed-case separators." },
@@ -913,11 +909,18 @@ type ListViewProps = {
 
 const ListView = ({ id, setIsModalNewTaskOpen }: ListViewProps) => {
   const { data: projects } = useGetProjectsQuery();
+  const { data: authData } = useGetAuthUserQuery(); // 🎯 Fetch Current User
+  
   const currentProject = projects?.find((p) => p.id === Number(id));
   const projectName = currentProject?.name || "";
+  const userName = authData?.user?.username || "Unknown User";
 
   // LAYOUT STATE
   const [isQcPanelOpen, setIsQcPanelOpen] = useState(true);
+
+  // 🎯 NEW: Tracking Database Metadata States
+  const [manualRoscoId, setManualRoscoId] = useState("");
+  const [destinationId, setDestinationId] = useState("");
 
   let availableChecks = defaultChecks;
   let isMarketProject = false;
@@ -925,7 +928,7 @@ const ListView = ({ id, setIsModalNewTaskOpen }: ListViewProps) => {
   // LOGO & TEXT COLOR LOGIC 
   let ProjectLogo = null;
   let projectColor = "bg-blue-600";
-  let projectTextColor = "text-blue-600 dark:text-blue-400"; // Added Text Color Variable
+  let projectTextColor = "text-blue-600 dark:text-blue-400"; 
 
   if (projectName === "Foot Ball" || projectName === "EPL") { 
     availableChecks = footballChecks; 
@@ -974,7 +977,12 @@ const ListView = ({ id, setIsModalNewTaskOpen }: ListViewProps) => {
   const [qcResultMeta, setQcResultMeta] = useState<{url: string, name: string} | null>(null);
 
   const isDarkMode = useAppSelector((state) => state.global.isDarkMode);
-  const isReadyToRun = isMarketProject ? (selectedBSRFile && selectedChecks.length > 0) : (selectedBSRFile && selectedRoscoFile);
+  
+  // 🎯 Make manualRoscoId a requirement to unlock the "Run" button
+  const isReadyToRun = isMarketProject 
+    ? (selectedBSRFile && selectedChecks.length > 0 && manualRoscoId.trim().length > 0) 
+    : (selectedBSRFile && selectedRoscoFile && manualRoscoId.trim().length > 0);
+    
   const combinedStatus = isLoading ? 'loading' : processStatus === 'complete' ? 'complete' : localError ? 'error' : 'idle';
 
   useEffect(() => {
@@ -996,7 +1004,7 @@ const ListView = ({ id, setIsModalNewTaskOpen }: ListViewProps) => {
       setProcessStatus('idle');
       setLocalError(null);
       setQcResultMeta(null);
-  }, [id, projectName,availableChecks]);
+  }, [id, projectName, availableChecks]);
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>, fileType: string) => {
     const file = event.target.files?.[0] || null;
@@ -1016,7 +1024,15 @@ const ListView = ({ id, setIsModalNewTaskOpen }: ListViewProps) => {
   const handleRunChecks = async () => {
     if (!isReadyToRun || isLoading) return;
     setProcessStatus('idle'); setLocalError(null); setQcResultMeta(null); 
+    
     const formData = new FormData();
+    
+    // 🎯 NEW: Append Database Metadata
+    formData.append('manual_rosco_id', manualRoscoId.trim());
+    if (destinationId) formData.append('destination_id', destinationId);
+    formData.append('project_name', projectName);
+    formData.append('user_name', userName);
+
     try {
         if (isMarketProject) {
             formData.append('bsr_file', selectedBSRFile as File);
@@ -1059,14 +1075,12 @@ const ListView = ({ id, setIsModalNewTaskOpen }: ListViewProps) => {
           </div>
           <div>
             <h1 className="text-lg font-extrabold tracking-tight leading-none dark:text-slate-100">
-              {/* BRANDED TEXT COLOR APPLIED HERE */}
               <span className={projectTextColor}>{projectName || "Global"}</span> Quality Checks
             </h1>
             <p className="text-[11px] text-slate-500 dark:text-slate-400 font-medium mt-1 uppercase tracking-widest">Quality Assurance</p>
           </div>
         </div>
 
-        {/* User Preference Toggle Button */}
         <button 
           onClick={() => setIsQcPanelOpen(!isQcPanelOpen)}
           className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all border ${
@@ -1092,7 +1106,6 @@ const ListView = ({ id, setIsModalNewTaskOpen }: ListViewProps) => {
           className={`flex flex-col bg-white dark:bg-[#0F131F] border border-slate-200 dark:border-slate-800 rounded-3xl shadow-sm transition-all duration-500 ease-in-out overflow-hidden
             ${isQcPanelOpen ? 'w-full lg:w-[450px] xl:w-[500px] opacity-100 shrink-0' : 'w-0 opacity-0 border-none'}`}
         >
-          {/* Header */}
           <div className="px-5 py-4 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center bg-slate-50 dark:bg-[#0B0F1A] shrink-0">
             <div className="flex items-center gap-2">
               <Settings2 size={16} className="text-slate-400" />
@@ -1108,7 +1121,6 @@ const ListView = ({ id, setIsModalNewTaskOpen }: ListViewProps) => {
             </div>
           </div>
 
-          {/* Scrolling Single Column List */}
           <div className="flex-1 overflow-y-auto p-4 custom-scrollbar
             [&::-webkit-scrollbar]:w-1.5 
             [&::-webkit-scrollbar-thumb]:bg-slate-200 dark:[&::-webkit-scrollbar-thumb]:bg-slate-700 
@@ -1135,7 +1147,6 @@ const ListView = ({ id, setIsModalNewTaskOpen }: ListViewProps) => {
                         {check.type}
                       </span>
                     </div>
-                    {/* Always visible description, no clicks needed */}
                     <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-relaxed pr-2">
                       {check.description}
                     </p>
@@ -1150,10 +1161,38 @@ const ListView = ({ id, setIsModalNewTaskOpen }: ListViewProps) => {
         <div className="flex-1 flex flex-col gap-6 min-w-0">
           
           {/* UPLOAD SECTION (Horizontal Row) */}
-          <div className="bg-white dark:bg-[#0F131F] border border-slate-200 dark:border-slate-800 rounded-3xl p-5 shadow-sm shrink-0">
+          <div className="bg-white dark:bg-[#0F131F] border border-slate-200 dark:border-slate-800 rounded-3xl p-5 shadow-sm shrink-0 flex flex-col">
             <h3 className="text-xs font-black uppercase tracking-widest text-slate-500 mb-4 flex items-center gap-2">
               <Database size={14} /> Payload & Execution
             </h3>
+
+            {/* 🎯 NEW: METADATA CAPTURE INPUTS */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+              <div className="relative">
+                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                  <Hash size={14} className="text-slate-400" />
+                </div>
+                <input 
+                  type="text" 
+                  placeholder="ROSCO ID (Required for Database Tracking)" 
+                  value={manualRoscoId}
+                  onChange={(e) => setManualRoscoId(e.target.value)}
+                  className={`w-full bg-slate-50 dark:bg-[#0B0F1A] border text-xs rounded-xl pl-9 pr-3 py-2.5 outline-none transition-all dark:text-white ${!manualRoscoId.trim() ? 'border-rose-300 dark:border-rose-500/50' : 'border-slate-200 dark:border-slate-800 focus:border-blue-500 focus:ring-1 focus:ring-blue-500'}`}
+                />
+              </div>
+              <div className="relative">
+                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                  <CalendarDays size={14} className="text-slate-400" />
+                </div>
+                <input 
+                  type="date" 
+                  placeholder="Delivery Target Date (Optional)" 
+                  value={destinationId}
+                  onChange={(e) => setDestinationId(e.target.value)}
+                  className="w-full bg-slate-50 dark:bg-[#0B0F1A] border border-slate-200 dark:border-slate-800 text-xs rounded-xl pl-9 pr-3 py-2.5 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all dark:text-slate-300 cursor-pointer"
+                />
+              </div>
+            </div>
             
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 h-full">
               

@@ -98,7 +98,7 @@ router = APIRouter()
 # --- Controller Functions ---
 
 # GET /projects (Equivalent to router.get("/", getProjects))
-@router.get("/", response_model=List[Project])
+@router.get("", response_model=List[Project])
 async def get_projects():
     """
     Mocks Project.findMany() and returns the list of all static projects.

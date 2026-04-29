@@ -32,15 +32,15 @@ const isBrowser = typeof window !== 'undefined';
 
 // ⚠️ IMPORTANT: We are forcing the AWS URL even for development
 // because that is likely the ONLY URL your Admin allowed.
-const IDP_URL = 'http://automationportal-app-np-1996887397.ap-south-1.elb.amazonaws.com';
+const IDP_URL = 'https://sportsautomation.nlsn.media';
 
 export const oktaAuth = isBrowser 
   ? new OktaAuth({
       issuer: 'https://nielsen.okta.com/oauth2/default',
-      clientId: '0oa25qglsixBrnZNV0h8',
+      clientId: '0oa26k5oa7keTeGqs0h8',
       
       // Force the production URL to satisfy the Okta Admin settings
-      redirectUri: `${IDP_URL}/login/callback`,
+      redirectUri: `${IDP_URL}/`,
       postLogoutRedirectUri: IDP_URL,
 
       scopes: ['openid', 'profile', 'email'],

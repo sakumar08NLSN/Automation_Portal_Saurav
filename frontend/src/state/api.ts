@@ -1,4 +1,6 @@
 import { createApi, fetchBaseQuery } from "@reduxjs/toolkit/query/react";
+import { oktaAuth } from "./authConfig";
+
 
 // ⚠️ TEMPORARY MOCK FOR AWS-AMPLIFY/AUTH
 const fetchAuthSession = async () => ({
@@ -152,6 +154,28 @@ export interface EarlyWarningResponse {
   date_columns: string[];
 }
 
+export interface DeliveryRecord {
+  tracking_id: string;
+  delivery_uid: string;
+  client_account: string;
+  description_text: string;
+  owner_fte: string;
+  office_location: string;
+  sport_category: string;
+  target_date: string;
+  delivery_status: string;
+  delay_severity: number;
+  is_backlog: number;
+  delivery_metrics: {
+    [key: string]: {
+      Total_Evaluated: number;
+      Passed: number;
+      Failed: number;
+    };
+  };
+  [key: string]: any;
+}
+
 // --- API DEFINITION ---
 
 export const api = createApi({
@@ -159,27 +183,48 @@ export const api = createApi({
     baseUrl: process.env.NEXT_PUBLIC_API_BASE_URL,
     timeout : 600000,
     prepareHeaders: async (headers) => {
-      const session = await fetchAuthSession();
-      const { accessToken } = session.tokens ?? {};
-      if (accessToken) {
-        headers.set("Authorization", `Bearer ${accessToken}`);
+      if (oktaAuth) {
+        const token = oktaAuth.getAccessToken();
+        if (token) {
+          headers.set("Authorization", `Bearer ${token}`);
+        }
       }
       return headers;
     },
   }),
   reducerPath: "api",
-  tagTypes: ["Projects", "Tasks", "Users", "Teams", "EPLFixtures", "EPLStandings", "EPLChecks", "QcResults"],
+  tagTypes: ["Projects", "Tasks", "Users", "Teams", "EPLFixtures", "EPLStandings", "EPLChecks", "QcResults","DeliveryAnalytics"],
   endpoints: (build) => ({
-    getAuthUser: build.query<AuthUserResponse, void>({
+    getAuthUser: build.query<any, void>({
       queryFn: async (_, _queryApi, _extraoptions, fetchWithBQ) => {
         try {
-          const user = await getCurrentUser();
-          const session = await fetchAuthSession();
-          if (!session) throw new Error("No session found");
-          const { userSub } = session;
+          // 🚨 LOCAL DEV SWITCH: Feed Redux a fake user so it ignores Okta
+          const isLocalDev = typeof window !== 'undefined' && window.location.hostname === 'localhost';
+          if (isLocalDev) {
+            return { 
+              data: { 
+                user: { username: "Local Admin", userId: "00u23vc7vi2VW8tBj0h8" }, 
+                userSub: "00u23vc7vi2VW8tBj0h8", 
+                userDetails: { username: "Local Admin", profilePictureUrl: "i1.jpg", teamId: 1 } 
+              } 
+            };
+          }
+
+          // --- NORMAL PRODUCTION OKTA FETCH ---
+          if (!oktaAuth) throw new Error("Okta Auth not initialized");
+          const user = await oktaAuth.getUser();
+          if (!user) throw new Error("No user found in Okta session");
+
+          const userSub = user.sub; 
+          const authUser = {
+            username: user.preferred_username || user.name || "Unknown User",
+            userId: userSub,
+          };
+
           const userDetailsResponse = await fetchWithBQ(`dashboard/users/${userSub}`);
-          const userDetails = userDetailsResponse.data as User;
-          return { data: { user, userSub, userDetails } };
+          const userDetails = userDetailsResponse.data;
+
+          return { data: { user: authUser, userSub, userDetails } };
         } catch (error: any) {
           return { error: error.message || "Could not fetch user data" };
         }
@@ -188,7 +233,7 @@ export const api = createApi({
     }),
     
     getProjects: build.query<Project[], void>({
-      query: () => "/dashboard/projects/",
+      query: () => "/dashboard/projects",
       providesTags: ["Projects"],
     }),
     
@@ -202,7 +247,7 @@ export const api = createApi({
     }),
     
     getTasks: build.query<Task[], { projectId: number }>({
-      query: ({ projectId }) => `/dashboard/tasks?projectId=${projectId}`,
+      query: ({ projectId }) => `/dashboard/tasks/?projectId=${projectId}`,
       providesTags: (result) =>
         result
           ? result.map(({ id }) => ({ type: "Tasks" as const, id }))
@@ -238,7 +283,7 @@ export const api = createApi({
     }),
     
     getUsers: build.query<User[], void>({
-      query: () => "/dashboard/users",
+      query: () => "/dashboard/users/",
       providesTags: ["Users"],
     }),
     
@@ -318,6 +363,13 @@ export const api = createApi({
       // Optional: Add a providesTags if you want to auto-refresh this when a new test runs
       // providesTags: ["QcHistory"], 
     }),
+
+    getDeliveryDashboard: build.query<DeliveryRecord[], void>({
+      query: () => "qc/delivery-analytics",
+      providesTags: ["DeliveryAnalytics"],
+    }),
+
+
     
     uploadFile: build.mutation<UploadResponse, FormData>({
         query: (formData) => ({
@@ -326,6 +378,17 @@ export const api = createApi({
             body: formData,
         }),
     }),
+
+    downloadWeeklyQcReport: build.query<Blob, { start_date?: string; end_date?: string }>({
+      query: (params) => ({
+        url: "qc/history/weekly-export",
+        method: "GET",
+        params: params, // RTK Query automatically turns this into ?start_date=X&end_date=Y
+        responseHandler: (response) => response.blob(),
+      }),
+    }),
+
+
   }),
 });
 
@@ -353,6 +416,9 @@ export const {
   useLazyDownloadFixtureTemplateQuery,
   //history
   useGetQcHistoryQuery,
+  useGetDeliveryDashboardQuery,
+
+  useLazyDownloadWeeklyQcReportQuery,
 } = api;
 
 // import { createApi, fetchBaseQuery, BaseQueryApi } from "@reduxjs/toolkit/query/react";

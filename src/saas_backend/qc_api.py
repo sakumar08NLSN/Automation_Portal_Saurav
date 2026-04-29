@@ -9,11 +9,12 @@ import time
 import logging
 import threading
 import io
+import csv
 from contextlib import asynccontextmanager
 from typing import Optional, List , Dict, Any
 from C_data_processing import DataExplorer
 import gc
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from usa_audit_service import process_usa_audit_logic_stream
 from mls_audit_service import process_mls_audit_logic_stream
 from intl_audit_service import process_intl_audit_logic_stream
@@ -21,11 +22,12 @@ from japan_service  import process_japan_bsr
 import traceback
 import tempfile
 import base64
+import gspread
 
 
 # 2. Add the SQLAlchemy Session
 from sqlalchemy.orm import Session
-
+from sqlalchemy.sql import func
 from sqlalchemy import desc
 
 # 3. Import your database connection and model
@@ -50,7 +52,30 @@ from mm_bsa_checks import (
     ea_creation_check,
     mm_bsr_consistency_check,
     audience_spot_range_clean_view,
-    previous_delivery_check
+    previous_delivery_check,
+    live_delayed_check,
+    program_analysis_status_check,
+)
+
+from ops_mm_bsa_checks import (
+    duplicate_aid_final,
+    audience_spotprice_check,
+    program_category_check_mm_ops,
+    channel_country_mapping_check,
+    apt_bt_check,
+    season_monitoring_check,
+    fixture_validation_check,
+    stadium_consistency_check,
+    event_quality_check,
+    home_market_check,
+    ps_content_check,
+    ps_market_channel_check,
+    ea_creation_check,
+    mm_bsr_consistency_check,
+    audience_spot_range_clean_view,
+    previous_delivery_check,
+    live_delayed_check,
+    program_analysis_status_check,
 )
 
 logger = logging.getLogger("uvicorn.error")
@@ -716,165 +741,340 @@ async def run_mm_bsa_qc(
     end_date: Optional[str] = Form(None)
 ):
     try:
-        print("🚀 REQUEST RECEIVED")
+        print("\n🚀 ===== NEW REQUEST =====")
 
-        checks = json.loads(selected_checks)
+        # ---------------- PARSE CHECKS ----------------
+        try:
+            checks = json.loads(selected_checks)
+        except:
+            raise HTTPException(400, "Invalid selected_checks format")
+
         print("✅ Selected checks:", checks)
 
-        # ---------------- INIT SAFE VARS ----------------
-        range_df = None
-        prev_range_df = None
+        # ---------------- SAVE FILES ----------------
+        def save_file(file, prefix):
+            if not file:
+                return None
+            path = os.path.join(UPLOAD_FOLDER, f"{prefix}{int(time.time())}{file.filename}")
+            with open(path, "wb") as f:
+                shutil.copyfileobj(file.file, f)
+            return path
 
-        # ---------------- ADAPT ----------------
-        adapt_path = os.path.join(UPLOAD_FOLDER, f"adapt_{adapt_file.filename}")
-        with open(adapt_path, "wb") as f:
-            shutil.copyfileobj(adapt_file.file, f)
+        adapt_path = save_file(adapt_file, "adapt")
+        rosco_path = save_file(rosco_file, "rosco")
+        fixture_path = save_file(fixture_file, "fixture")
+        prev_path = save_file(previous_delivery_file, "prev")
+        bsr_path = save_file(bsr_file, "bsr")
 
-        print("✅ Adapt file saved")
+        print("📁 Files saved")
 
-        df = pd.read_excel(adapt_path, sheet_name="mm - detailed")
+        # ---------------- LOAD ADAPT ----------------
+        try:
+            df = pd.read_excel(adapt_path, sheet_name="mm - detailed")
+        except:
+            df = pd.read_excel(adapt_path)
+
         df.columns = df.columns.str.strip()
-
         print("✅ Adapt loaded:", df.shape)
 
-        # ---------------- ROSCO ----------------
-        rosco_path = None
-        if rosco_file:
-            rosco_path = os.path.join(UPLOAD_FOLDER, f"rosco_{rosco_file.filename}")
-            with open(rosco_path, "wb") as f:
-                shutil.copyfileobj(rosco_file.file, f)
-            print("✅ ROSCO saved")
-
-        # ---------------- FIXTURE ----------------
+        # ---------------- LOAD OPTIONAL FILES ----------------
         fixture_df = None
-        if fixture_file:
-            fixture_path = os.path.join(UPLOAD_FOLDER, f"fixture_{fixture_file.filename}")
-            with open(fixture_path, "wb") as f:
-                shutil.copyfileobj(fixture_file.file, f)
-
+        if fixture_path:
             fixture_df = pd.read_excel(fixture_path)
             fixture_df.columns = fixture_df.columns.str.strip()
-            print("✅ Fixture loaded")
 
-        # ---------------- PREVIOUS DELIVERY ----------------
         previous_delivery_df = None
-        if previous_delivery_file:
-            prev_path = os.path.join(UPLOAD_FOLDER, f"prev_{previous_delivery_file.filename}")
-            with open(prev_path, "wb") as f:
-                shutil.copyfileobj(previous_delivery_file.file, f)
-
+        if prev_path:
             previous_delivery_df = pd.read_excel(prev_path)
             previous_delivery_df.columns = previous_delivery_df.columns.str.strip()
 
-            print("✅ Previous delivery loaded")
-
-        # ---------------- BSR ----------------
         bsr_df = None
-        if bsr_file:
-            bsr_path = os.path.join(UPLOAD_FOLDER, f"bsr_{bsr_file.filename}")
-            with open(bsr_path, "wb") as f:
-                shutil.copyfileobj(bsr_file.file, f)
-            
-            # NEW LOGIC: Use header=None first to find the real header row
-            # We load the 'Database' sheet and tell pandas the headers are on the 6th row (index 5)
+        if bsr_path:
             try:
-                bsr_df = pd.read_excel(
-                    bsr_path, 
-                    sheet_name="Database", 
-                    header=5  # index 5 is the 6th row in Excel
-                )
-                # Clean up any leading/trailing spaces in the headers immediately
-                bsr_df.columns = bsr_df.columns.str.strip()
-                print(f"✅ BSR loaded from Database tab. Columns: {list(bsr_df.columns[:10])}...")
-            except Exception as e:
-                print(f"❌ Failed to load Database tab from BSR: {e}")
-                # Fallback if the tab name is slightly different
+                bsr_df = pd.read_excel(bsr_path, sheet_name="Database", header=5)
+            except:
                 bsr_df = pd.read_excel(bsr_path, header=5)
-                bsr_df.columns = bsr_df.columns.str.strip()
 
-                print("✅ BSR loaded")
+            bsr_df.columns = bsr_df.columns.str.strip()
 
-        # ---------------- CHECKS ----------------
+        # ---------------- RUN CHECKS ----------------
         print("⚙️ Running checks...")
 
+        range_df = None
+        prev_range_df = None
+
         if "duplicate_aid_final" in checks:
-            print("➡️ duplicate_aid_final")
             df = duplicate_aid_final(df)
 
         if "audience_spotprice_check" in checks:
-            print("➡️ audience_spotprice_check")
             df = audience_spotprice_check(df)
 
-        if "program_category_check" in checks:
-            print("➡️ program_category_check")
+        if "program_category_check_mm" in checks:
             df = program_category_check_mm(df)
 
         if "ea_creation_check" in checks:
-            print("➡️ ea_creation_check")
             df = ea_creation_check(df)
 
         if "channel_country_mapping_check" in checks:
             if not rosco_path:
-                raise HTTPException(400, "ROSCO required")
-            print("➡️ channel_country_mapping_check")
+                raise HTTPException(400, "ROSCO file required for channel mapping")
             df = channel_country_mapping_check(df, rosco_path)
 
         if "ps_market_channel_check" in checks or "ps_content_check" in checks:
             if not rosco_path:
                 raise HTTPException(400, "ROSCO required")
 
-            print("➡️ Reading ROSCO Monitoring List")
             monitoring_df = pd.read_excel(rosco_path, sheet_name="Monitoring List")
 
             if "ps_market_channel_check" in checks:
-                print("➡️ ps_market_channel_check")
                 df = ps_market_channel_check(df, monitoring_df)
 
             if "ps_content_check" in checks:
-                print("➡️ ps_content_check")
                 df = ps_content_check(df, monitoring_df)
 
         if "mm_bsr_consistency_check" in checks:
             if bsr_df is None:
-                raise HTTPException(400, "BSR required")
-
-            print("➡️ mm_bsr_consistency_check")
+                raise HTTPException(400, "BSR file required")
             df = mm_bsr_consistency_check(df, bsr_df)
 
         if "audience_spot_range_clean_view" in checks:
-            print("➡️ audience_spot_range_clean_view")
             range_df = audience_spot_range_clean_view(df)
 
         if "previous_delivery_check" in checks:
             if previous_delivery_df is None:
-                raise HTTPException(400, "Previous delivery required")
-
-            print("➡️ previous_delivery_check")
+                raise HTTPException(400, "Previous delivery file required")
             prev_range_df = previous_delivery_check(df, previous_delivery_df)
 
-        # ---------------- OUTPUT ----------------
-        print("💾 Writing output...")
+        if "season_monitoring_check" in checks:
+            if not start_date or not end_date:
+                raise HTTPException(400, "Start and End date required")
+            df = season_monitoring_check(df, start_date, end_date)
 
+        if "fixture_validation_check" in checks:
+            if fixture_df is None:
+                raise HTTPException(400, "Fixture file required")
+            df = fixture_validation_check(df, fixture_df)
+
+        if "apt_bt_check" in checks:
+            df = apt_bt_check(df, bt_threshold)
+
+        if "stadium_consistency_check" in checks:
+            df = stadium_consistency_check(df)
+
+        if "event_quality_check" in checks:
+            df = event_quality_check(df)
+
+        if "home_market_check" in checks:
+            df = home_market_check(df)
+
+        print("✅ All checks completed")
+
+        # ---------------- OUTPUT ----------------
         output_path = os.path.join(OUTPUT_FOLDER, f"MM_BSA_QC_{int(time.time())}.xlsx")
 
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="MM_QC_Output", index=False)
 
-            if range_df is not None:
+            if range_df is not None and not range_df.empty:
                 range_df.to_excel(writer, sheet_name="Audience_Range_Check", index=False)
 
-            if prev_range_df is not None:
+            if prev_range_df is not None and not prev_range_df.empty:
                 prev_range_df.to_excel(writer, sheet_name="Previous_Delivery_Check", index=False)
 
-        print("✅ DONE")
+        print("📄 Output generated:", output_path)
 
-        return FileResponse(output_path, filename="MM_BSA_QC_Output.xlsx")
+        return FileResponse(
+            output_path,
+            filename="MM_BSA_QC_Output.xlsx",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    except HTTPException as e:
+        print("❌ USER ERROR:", e.detail)
+        raise e
 
     except Exception as e:
-        import traceback
         traceback.print_exc()
-        print("❌ ERROR:", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        print("❌ SYSTEM ERROR:", str(e))
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Backend crashed: {str(e)}"}
+        )
+
+@qc_router.post("/run-mm-exclusive-qc")
+async def run_mm_exclusive_qc(
+    adapt_file: UploadFile = File(...),
+    rosco_file: Optional[UploadFile] = File(None),   
+    fixture_file: Optional[UploadFile] = File(None), 
+    previous_delivery_file: Optional[UploadFile] = File(None),
+    bsr_file: Optional[UploadFile] = File(None),
+    selected_checks: str = Form(...),
+    bt_threshold: Optional[float] = Form(None),
+    start_date: Optional[str] = Form(None),
+    end_date: Optional[str] = Form(None)
+):
+    try:
+        print("\n🚀 ===== OPS MM EXCLUSIVE REQUEST =====")
+
+        # ---------------- PARSE CHECKS ----------------
+        try:
+            checks = json.loads(selected_checks)
+        except:
+            raise HTTPException(400, "Invalid selected_checks format")
+
+        print("✅ Selected checks:", checks)
+
+        # ---------------- SAVE FILES ----------------
+        def save_file(file, prefix):
+            if not file:
+                return None
+            path = os.path.join(UPLOAD_FOLDER, f"{prefix}{int(time.time())}{file.filename}")
+            with open(path, "wb") as f:
+                shutil.copyfileobj(file.file, f)
+            return path
+
+        adapt_path = save_file(adapt_file, "adapt")
+        rosco_path = save_file(rosco_file, "rosco")
+        fixture_path = save_file(fixture_file, "fixture")
+        prev_path = save_file(previous_delivery_file, "prev")
+        bsr_path = save_file(bsr_file, "bsr")
+
+        print("📁 Files saved")
+
+        # ---------------- LOAD MAIN FILE ----------------
+        try:
+            df = pd.read_excel(adapt_path, sheet_name="mm - detailed")
+        except:
+            df = pd.read_excel(adapt_path)
+
+        df.columns = df.columns.str.strip()
+        print("✅ DPMM loaded:", df.shape)
+
+        # ---------------- OPTIONAL FILES ----------------
+        fixture_df = pd.read_excel(fixture_path) if fixture_path else None
+        previous_delivery_df = pd.read_excel(prev_path) if prev_path else None
+
+        bsr_df = None
+        if bsr_path:
+            try:
+                bsr_df = pd.read_excel(bsr_path, sheet_name="Database", header=5)
+            except:
+                bsr_df = pd.read_excel(bsr_path, header=5)
+
+        # ---------------- RUN CHECKS ----------------
+        print("⚙️ Running OPS checks...")
+
+        range_df = None
+        prev_range_df = None
+
+        if "duplicate_aid_final" in checks:
+            df = duplicate_aid_final(df)
+
+        if "audience_spotprice_check" in checks:
+            df = audience_spotprice_check(df)
+
+        # ✅ NOW SAME AS MM-BSA
+        if "program_category_check_mm_ops" in checks:
+            df = program_category_check_mm_ops(df)
+
+        if "ea_creation_check" in checks:
+            df = ea_creation_check(df)
+
+        if "channel_country_mapping_check" in checks:
+            if not rosco_path:
+                raise HTTPException(400, "ROSCO required")
+            df = channel_country_mapping_check(df, rosco_path)
+
+        if "ps_market_channel_check" in checks or "ps_content_check" in checks:
+            if not rosco_path:
+                raise HTTPException(400, "ROSCO required")
+
+            monitoring_df = pd.read_excel(rosco_path, sheet_name="Monitoring List")
+
+            if "ps_market_channel_check" in checks:
+                df = ps_market_channel_check(df, monitoring_df)
+
+            if "ps_content_check" in checks:
+                df = ps_content_check(df, monitoring_df)
+
+        if "mm_bsr_consistency_check" in checks:
+            if bsr_df is None:
+                raise HTTPException(400, "BSR file required")
+            df = mm_bsr_consistency_check(df, bsr_df)
+
+        if "audience_spot_range_clean_view" in checks:
+            range_df = audience_spot_range_clean_view(df)
+
+        if "previous_delivery_check" in checks:
+            if previous_delivery_df is None:
+                raise HTTPException(400, "Previous delivery required")
+            prev_range_df = previous_delivery_check(df, previous_delivery_df)
+
+        if "season_monitoring_check" in checks:
+            if not start_date or not end_date:
+                raise HTTPException(400, "Start & End date required")
+            df = season_monitoring_check(df, start_date, end_date)
+
+        if "fixture_validation_check" in checks:
+            if fixture_df is None:
+                raise HTTPException(400, "Fixture required")
+            df = fixture_validation_check(df, fixture_df)
+
+        if "apt_bt_check" in checks:
+            df = apt_bt_check(df, bt_threshold)
+
+        if "stadium_consistency_check" in checks:
+            df = stadium_consistency_check(df)
+
+        if "event_quality_check" in checks:
+            df = event_quality_check(df)
+
+        if "home_market_check" in checks:
+            df = home_market_check(df)
+
+        if "live_delayed_check" in checks:
+            df = live_delayed_check(df)
+
+        if "program_analysis_status_check" in checks:
+            df = program_analysis_status_check(df)
+
+        print("✅ OPS checks completed")
+
+        # ---------------- OUTPUT ----------------
+        output_path = os.path.join(
+            OUTPUT_FOLDER,
+            f"OPS_MM_QC_{int(time.time())}.xlsx"
+        )
+
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="OPS_QC_Output", index=False)
+
+            if range_df is not None and not range_df.empty:
+                range_df.to_excel(writer, sheet_name="Audience_Range", index=False)
+
+            if prev_range_df is not None and not prev_range_df.empty:
+                prev_range_df.to_excel(writer, sheet_name="Previous_Delivery", index=False)
+
+        print("📄 OPS Output generated:", output_path)
+
+        return FileResponse(
+            output_path,
+            filename="OPS_MM_QC_Output.xlsx",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    except HTTPException as e:
+        print("❌ USER ERROR:", e.detail)
+        raise e
+
+    except Exception as e:
+        traceback.print_exc()
+        print("❌ SYSTEM ERROR:", str(e))
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Backend crashed: {str(e)}"}
+        )
+
 
     
 @qc_router.get("/download-fixture-template")
@@ -901,8 +1101,6 @@ def download_fixture_template():
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-
-
 @qc_router.get("/history")
 def get_qc_history(db: Session = Depends(get_db)):
     """Fetches all QC audit history for the Manager Dashboard"""
@@ -913,6 +1111,125 @@ def get_qc_history(db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"❌ Error fetching history: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch QC history")
+
+
+@qc_router.get("/history/weekly-export")
+def export_qc_report(
+    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    db: Session = Depends(get_db)
+):
+    """Generates a downloadable CSV report grouped by Rosco ID showing QC progress."""
+    try:
+        query = db.query(RoscoSubmission)
+
+        # 1. Date Filtering Logic
+        if start_date:
+            dt_start = datetime.strptime(start_date, "%Y-%m-%d")
+            query = query.filter(RoscoSubmission.created_at >= dt_start)
+        
+        if end_date:
+            # Add 1 day to the end date to make it inclusive (up to 23:59:59)
+            dt_end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+            query = query.filter(RoscoSubmission.created_at < dt_end)
+
+        # If neither is provided, default to the last 7 days
+        if not start_date and not end_date:
+            query = query.filter(RoscoSubmission.created_at >= (func.now() - timedelta(days=7)))
+
+        # Fetch records
+        records = query.order_by(RoscoSubmission.created_at.asc()).all()
+
+        # 2. Group by rosco_id
+        grouped_data = {}
+        for r in records:
+            rid = r.rosco_id or r.manual_rosco_id or "UNKNOWN_ID"
+            if rid not in grouped_data:
+                grouped_data[rid] = []
+            grouped_data[rid].append(r)
+
+        # 3. Create CSV in memory
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        headers = [
+            "Rosco ID", "Project Name", "Total Runs", 
+            "First Run Date", "Latest Run Date",
+            "Initial Processing Speed (rows/sec)", "Latest Processing Speed (rows/sec)", "Speed Progress",
+            "Initial Errors", "Latest Errors", "Error Progress",
+            "Initial Error Density (%)", "Latest Error Density (%)",
+            "Latest Run Duration (s)", "Remaining Failed Rules (Latest)"
+        ]
+        writer.writerow(headers)
+
+        # 4. Calculate metrics with safe null-checking (same as before)
+        for rid, runs in grouped_data.items():
+            first_run = runs[0]
+            latest_run = runs[-1]
+            total_runs = len(runs)
+
+            def extract_stats(run):
+                max_rows = 0
+                total_evals = 0
+                if run.qc_summary and isinstance(run.qc_summary, dict):
+                    for rule, stats in run.qc_summary.items():
+                        if isinstance(stats, dict):
+                            evals = stats.get("Total_Evaluated", 0) or 0
+                            total_evals += evals
+                            if evals > max_rows: max_rows = evals
+                                
+                duration = run.run_duration or 0.0
+                speed = (max_rows / duration) if duration > 0 else 0.0
+                err_count = run.error_count or 0
+                density = (err_count / total_evals * 100) if total_evals > 0 else 0.0
+                return round(speed, 1), round(density, 1)
+
+            first_speed, first_density = extract_stats(first_run)
+            latest_speed, latest_density = extract_stats(latest_run)
+
+            first_err_count = first_run.error_count or 0
+            latest_err_count = latest_run.error_count or 0
+
+            err_diff = latest_err_count - first_err_count
+            err_progress = f"{abs(err_diff)} {'Fewer' if err_diff <= 0 else 'MORE'} Errors" if total_runs > 1 else "No prior runs"
+            speed_diff = round(latest_speed - first_speed, 1)
+            speed_progress = f"{'+' if speed_diff >= 0 else ''}{speed_diff} rows/s" if total_runs > 1 else "N/A"
+
+            failed_rules = []
+            if latest_run.qc_summary and isinstance(latest_run.qc_summary, dict):
+                for rule, stats in latest_run.qc_summary.items():
+                    if isinstance(stats, dict) and stats.get("Failed", 0) > 0:
+                        failed_rules.append(f"{str(rule).replace('_', ' ').title()} ({stats['Failed']})")
+            
+            failed_str = " | ".join(failed_rules) if failed_rules else "Perfect Clean Run"
+            first_date = first_run.created_at.strftime("%Y-%m-%d %H:%M") if first_run.created_at else "Unknown Date"
+            latest_date = latest_run.created_at.strftime("%Y-%m-%d %H:%M") if latest_run.created_at else "Unknown Date"
+
+            writer.writerow([
+                rid, latest_run.project_name or "N/A", total_runs, first_date, latest_date,
+                first_speed, latest_speed, speed_progress, first_err_count, latest_err_count,
+                err_progress, f"{first_density}%", f"{latest_density}%",
+                round(latest_run.run_duration or 0.0, 1), failed_str
+            ])
+
+        output.seek(0)
+        
+        # Name file dynamically based on dates provided
+        date_label = f"{start_date}_to_{end_date}" if start_date and end_date else "Last_7_Days"
+        filename = f"QC_Progress_Report_{date_label}.csv"
+        
+        return StreamingResponse(
+            iter([output.getvalue()]), 
+            media_type="text/csv", 
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    except Exception as e:
+        error_details = str(e)
+        logger.error(f"❌ Error generating report: {error_details}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Detailed Error: {error_details}")
+
 
 def clean_numeric_value(val):
     """Handles currency ($), commas, and Excel errors (#REF!, #N/A)."""
@@ -1122,12 +1439,13 @@ async def calculate_japan_audit(
         media_type="text/event-stream"
     )
 
-
 @qc_router.post("/calculate_intl_final_audit")
 async def calculate_intl_audit(
-    intl_data: UploadFile = File(...), # If needed for future steps
-    cpm_file: UploadFile = File(...),     # Contains "CPT List" and "Core Data"
-    euro_file: UploadFile = File(...)
+    intl_data: UploadFile = File(...), 
+    cpm_file: UploadFile = File(...),    
+    euro_file: UploadFile = File(...),
+    sport_genre: str = Form(...),      # Captures the Sport Genre from Frontend
+    spot_fixture: str = Form(...)      # Captures the Spot Rate from Frontend
 ):
     """
     Endpoint to process the International Audit.
@@ -1138,6 +1456,8 @@ async def calculate_intl_audit(
             intl_data,  
             cpm_file, 
             euro_file,
+            sport_genre,               # Pass it into the logic stream
+            spot_fixture,              # Pass it into the logic stream
             UPLOAD_FOLDER
         ),
         media_type="text/event-stream"
@@ -1187,8 +1507,20 @@ def market_check_and_process(
     overnight_file: Optional[UploadFile] = File(None, description="Overnight Audience file for upscale/integrity check"),
     macro_file: Optional[UploadFile] = File(None, description="Macro BSA Market Duplicator file"),
     checks: List[str] = Form(..., description="List of selected check keys"),
-    check_configs: str = Form("{}", description="JSON string of runtime configurations")
+    check_configs: str = Form("{}", description="JSON string of runtime configurations"),
+    
+    # 🎯 NEW: Tracking Metadata from Frontend
+    manual_rosco_id: Optional[str] = Form(None, description="Rosco ID"),
+    destination_id: Optional[str] = Form(None, description="Delivery Target Date or ID"),
+    project_name: Optional[str] = Form(None, description="Project Name"),
+    user_name: Optional[str] = Form("System", description="User triggering the check"),
+    
+    # 🎯 NEW: Database Session
+    db: Session = Depends(get_db)
 ):
+    # Track execution time for analytics
+    start_time = time.time()
+    
     bsr_file_path = os.path.join(UPLOAD_FOLDER, bsr_file.filename)
     obligation_path, overnight_path, macro_path = None, None, None
     
@@ -1211,15 +1543,18 @@ def market_check_and_process(
             obligation_path = os.path.join(UPLOAD_FOLDER, obligation_file.filename)
             with open(obligation_path, "wb") as buffer:
                 shutil.copyfileobj(obligation_file.file, buffer)
+                
         if overnight_file and overnight_file.filename: 
             overnight_path = os.path.join(UPLOAD_FOLDER, overnight_file.filename)
             with open(overnight_path, "wb") as buffer:
                 shutil.copyfileobj(overnight_file.file, buffer)
+                
         if macro_file and macro_file.filename: 
             macro_path = os.path.join(UPLOAD_FOLDER, macro_file.filename)
             with open(macro_path, "wb") as buffer:
                 shutil.copyfileobj(macro_file.file, buffer)
 
+        # Assuming EPL_CHECK_KEYS is defined somewhere above
         bsr_checks_to_run = [c for c in checks if c not in EPL_CHECK_KEYS]
         epl_checks_to_run = [c for c in checks if c in EPL_CHECK_KEYS]
 
@@ -1230,8 +1565,9 @@ def market_check_and_process(
             'macro_path': macro_path
         }
         
+        # Assuming BSRValidator and EPLValidator are imported/defined
         bsr_validator = BSRValidator(**shared_kwargs)
-        epl_validator = EPLValidator(df=bsr_validator.df,**shared_kwargs)
+        epl_validator = EPLValidator(df=bsr_validator.df, **shared_kwargs)
 
         if bsr_checks_to_run:
             status_summaries.extend(bsr_validator.market_check_processor(bsr_checks_to_run))
@@ -1253,6 +1589,89 @@ def market_check_and_process(
 
         clean_summaries = [s for s in status_summaries if isinstance(s, dict)]
         
+        # -------------------------------------------------------------------
+        # 🎯 SMART DB PARSER: Fixes missing 'rows_flagged' and builds DB Object
+        # -------------------------------------------------------------------
+        import re
+        
+        qc_summary_db = {}
+        total_absolute_errors = 0
+        base_total = len(df_processed) if df_processed is not None else 0
+
+        for s in clean_summaries:
+            check_name = s.get("action", s.get("check_key", "Unknown Check"))
+            status = s.get("status", "Passed")
+            desc = s.get("description", "")
+            
+            # 1. Ensure details dictionary exists
+            if "details" not in s or not isinstance(s["details"], dict):
+                s["details"] = {}
+                
+            fails = s["details"].get("rows_flagged", 0)
+            
+            # 2. MAGIC FIX: If the script forgot to set rows_flagged, extract it from the description string!
+            if (fails == 0 or fails is None) and status in ['Flagged', 'Failed', 'Issue Found', 'Error']:
+                match = re.search(r'[Ff]ound\s+(\d+)', desc)
+                if match:
+                    fails = int(match.group(1))
+                else:
+                    fails = 1 # Fallback so the DB knows it failed
+                
+                # INJECT IT BACK IN! This automatically fixes the UI "Anomalies" column!
+                s["details"]["rows_flagged"] = fails
+                
+            # 3. Extract the Total Evaluated rows from the description
+            match_eval = re.search(r'[Aa]udited\s+(\d+)\s+rows', desc)
+            if match_eval:
+                eval_total = int(match_eval.group(1))
+            else:
+                eval_total = base_total
+                
+            if fails > eval_total:
+                eval_total = fails
+                
+            passes = eval_total - fails
+            na = 0
+            
+            # 4. Handle Skipped checks safely
+            if status == 'Skipped':
+                passes = 0
+                fails = 0
+                na = eval_total
+                s["details"]["rows_flagged"] = 0
+
+            # 5. Assign to the Database Dictionary
+            qc_summary_db[check_name] = {
+                "Total_Evaluated": eval_total,
+                "Passed": passes,
+                "Failed": fails,
+                "NA": na
+            }
+            total_absolute_errors += fails
+
+        run_duration = time.time() - start_time
+        
+        # Save securely to PostgreSQL
+        try:
+            safe_rosco_id = manual_rosco_id or bsr_file.filename.split('.')[0]
+            db_record = RoscoSubmission(
+                rosco_id=safe_rosco_id,
+                manual_rosco_id=manual_rosco_id,
+                project_name=project_name,
+                destination_id=destination_id,
+                user_name=user_name,
+                run_duration=round(run_duration, 2),
+                error_count=total_absolute_errors,
+                qc_summary=qc_summary_db,
+                original_filename=bsr_file.filename
+            )
+            db.add(db_record)
+            db.commit()
+        except Exception as db_err:
+            print(f"⚠️ Failed to save to database: {str(db_err)}")
+        # -------------------------------------------------------------------
+
+        # Save to Excel
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
             df_processed.to_excel(writer, sheet_name='Processed BSR', index=False)
             
@@ -1262,7 +1681,7 @@ def market_check_and_process(
             "status": "Success",
             "message": f"Successfully applied {len(checks)} market checks.",
             "download_url": download_url,
-            "summaries": clean_summaries
+            "summaries": clean_summaries # This now contains the fixed 'rows_flagged' data!
         })
 
     except Exception as e:
@@ -1279,19 +1698,29 @@ def market_check_and_process(
 # -------------------- 📥 NEW DOWNLOAD ENDPOINT --------------------
 @qc_router.get("/download_file")
 async def download_file(filename: str = Query(...)):
-    file_path = os.path.join(OUTPUT_FOLDER, filename)
+    # 1. SANITIZE: Extract ONLY the file name, destroying any "../" or "/" characters
+    safe_filename = os.path.basename(filename)
+    
+    # 2. RESOLVE: Create the absolute, real path on the server
+    expected_dir = os.path.abspath(OUTPUT_FOLDER)
+    file_path = os.path.abspath(os.path.join(expected_dir, safe_filename))
+
+    # 3. VERIFY: Mathematically ensure the final path still starts with your expected directory
+    if not file_path.startswith(expected_dir):
+        raise HTTPException(status_code=403, detail="Forbidden: Invalid file path detected.")
 
     # --- DEBUG PRINTS ---
-    print(f"DEBUG: Endpoint hit! Looking for file: {filename}")
+    print(f"DEBUG: Endpoint hit! Looking for file: {safe_filename}")
     print(f"DEBUG: Full path constructed: {file_path}")
     print(f"DEBUG: Does file exist? {os.path.exists(file_path)}")
     # --------------------
 
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found or link has expired.")
+        
     return FileResponse(
         path=file_path,
-        filename=filename,
+        filename=safe_filename,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -4553,3 +4982,153 @@ async def generate_timeline_only(bsa_file: UploadFile = File(...)):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Initialize Google Sheets 
+# Initialize Google Sheets 
+gc = gspread.oauth(
+    credentials_filename='client_secrets.json',     
+    authorized_user_filename='authorized_user.json' 
+)
+SHEET_ID = "1Sufswj10ntTAfFrjc4WGOxDswR5oHyakvVdsXyps91U"
+
+@qc_router.get("/delivery-analytics")
+def get_delivery_dashboard_data():
+    sh = gc.open_by_key(SHEET_ID)
+    worksheet = sh.worksheet("Overview")
+    
+    raw_data = worksheet.get_all_values()
+    
+    if not raw_data or len(raw_data) < 2:
+        return []
+
+    # 🧹 MAGIC FIX 1: SMART HEADER DETECTION
+    # Scan the first 20 rows to find where the actual headers start
+    header_row_index = 0
+    for i, row in enumerate(raw_data[:20]):
+        # If this row contains our core ID columns, it's the real header row!
+        if "ROSCO ID" in row or "Delivery ID" in row:
+            header_row_index = i
+            break
+
+    # Clean the actual header row
+    raw_headers = raw_data[header_row_index]
+    headers = [re.sub(r'\s+', ' ', str(h)).strip() for h in raw_headers]
+    
+    # The data rows are everything AFTER the header row
+    rows = raw_data[header_row_index + 1:]
+
+    print(f"\n✅ FOUND HEADERS ON ROW {header_row_index + 1}")
+    print(f"✅ FOUND {len(rows)} ROWS OF DATA")
+
+    formatted_payload = []
+    
+    # --- HELPER FUNCTIONS FOR GOOGLE SHEETS DATA ---
+    def safe_int(value):
+        if not value: return 0
+        val_str = str(value).strip().replace(',', '')
+        if val_str in ['-', 'N/A', '', 'None', '#N/A']: return 0
+        try:
+            return int(float(val_str))
+        except ValueError:
+            return 0
+            
+    def safe_float(value):
+        if not value: return 0.0
+        val_str = str(value).strip().replace('%', '').replace(',', '')
+        if val_str in ['-', 'N/A', '', 'None', '#N/A', '#REF!']: return 0.0
+        try:
+            return float(val_str)
+        except ValueError:
+            return 0.0
+    
+    def gms_parse_date(date_str):
+        if not date_str or date_str in ['-', 'N/A', '', 'None']: return None
+        try:
+            # Adjust format if your sheet uses DD/MM/YYYY or MM/DD/YYYY
+            return datetime.strptime(str(date_str).strip(), '%Y-%m-%d')
+        except:
+            return None
+    # -----------------------------------------------
+
+    for row in rows:
+        row_dict = dict(zip(headers, row))
+
+        # 🛑 EXCLUDE RR JOBS
+        if row_dict.get('Job') == 'RR':
+            continue
+
+        # 🛑 KEEP ONLY 'CONFIRMED' ROSCO STATUS
+        rosco_status_raw = str(row_dict.get('Rosco Status', '')).strip().lower()
+        if rosco_status_raw != 'confirmed':
+            continue
+
+        # Logic for SLA Met (Original vs Delivered)
+        original_date = gms_parse_date(row_dict.get('Original Delivery Date'))
+        delivered_date = gms_parse_date(row_dict.get('Delivered Date'))
+        
+        sla_met = False
+        if original_date and delivered_date:
+            sla_met = delivered_date <= original_date
+        elif original_date and not delivered_date:
+            sla_met = False # Not delivered yet, so not met
+        
+        # 🧠 MAGIC FIX 2: Handle Negative Delays
+        delay_raw = safe_int(row_dict.get('Delay in days', 0))
+        delay_severity = abs(delay_raw) if delay_raw < 0 else 0
+
+        error_val = safe_float(row_dict.get('Error %', 0))
+        expected_effort = safe_float(row_dict.get('Expected Effort', 0))
+        actual_spent = safe_float(row_dict.get('Actual Spent', 0))
+
+        item = {
+            "tracking_id": row_dict.get('ROSCO ID', ''),
+            "delivery_uid": row_dict.get('Delivery ID', ''),
+            "client_account": row_dict.get('Product/Client', ''),
+            "description_text": row_dict.get('Description', ''),
+            "owner_fte": row_dict.get('FTE', ''),
+            "office_location": row_dict.get('Office', ''),
+            "sport_category": row_dict.get('Sport', ''),
+            "target_date": row_dict.get('Best Expected Date', ''),
+            "delivery_status": row_dict.get('Delivery Status', ''),
+            "delay_severity": delay_severity, 
+            "is_backlog": 1 if row_dict.get('transition') == 'backlog' else 0,
+            
+            "POC": row_dict.get('POC', ''),
+            "Rework (Yes/No)": row_dict.get('Rework (Yes/No)', ''),
+            "Expected Effort": expected_effort,
+            "Actual Spent": actual_spent,
+            "Delivery Detail": row_dict.get('Delivery Detail', ''),
+            "Assignment status": row_dict.get('Assignment status', ''),
+            "Delivery Delay Reason": row_dict.get('Delivery Delay Reason', ''),
+            "Rework Reason": row_dict.get('Rework Reason', ''),
+            "Job": row_dict.get('Job', ''),
+            
+            "Monitoring Start Date": row_dict.get('Monitoring Start Date', ''),
+            "Monitoring End Date": row_dict.get('Monitoring End Date', ''),
+            "Original Delivery Date": row_dict.get('Original Delivery Date', ''),
+            "Rework Postponement Date": row_dict.get('Rework Postponement Date', ''),
+            "Delivered Date": row_dict.get('Delivered Date', ''),
+            "Final Delivery Date": row_dict.get('Final Delivery Date', ''),
+            
+            "original_delivery_date": row_dict.get('Original Delivery Date', ''),
+            "rosco_status": row_dict.get('Rosco Status', ''),
+            "actual_delivered_date": row_dict.get('Delivered Date', ''),
+            "sla_status": "MET" if sla_met else "MISSED",
+
+            "delivery_metrics": {
+                "Workload": {
+                    "Total_Evaluated": safe_int(row_dict.get('Total Lines', 0)),
+                    "Passed": safe_int(row_dict.get('In Scope', 0)),
+                    "Failed": safe_int(row_dict.get('Out Of Scope', 0)),
+                },
+                "Accuracy": {
+                    "Total_Evaluated": 100,
+                    "Passed": 100 - error_val,
+                    "Failed": error_val,
+                }
+            }
+        }
+        formatted_payload.append(item)
+
+    return formatted_payload

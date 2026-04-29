@@ -6,6 +6,7 @@ import numpy as np
 import io
 import base64
 import gc
+import re
 from datetime import datetime
 
 # --- CHANNEL NAME MAPPING ---
@@ -65,32 +66,34 @@ RAW_CHANNEL_MAPPING = {
     "DISCOVERY CHANNEL": "Discovery Channel USA", "CNBC": "CNBC USA", "USA": "USA Network",
     "ESPN2": "ESPN 2 USA", "FOX (WNYW) New York": "FOX USA"
 }
-
 CHANNEL_MAPPING = {k.strip().upper(): v.strip().upper() for k, v in RAW_CHANNEL_MAPPING.items()}
+def normalize_channel_name(name):
+    if pd.isna(name): return "UNKNOWN"
+    n = str(name).strip().upper()
+    if any(x in n for x in ["WNYW", "WFXT", "FOX USA"]) or (n.startswith("FOX") and "(" in n):
+        return "FOX USA"
+    if any(x in n for x in ["KTLA", "KDAF", "CW"]) or (n.startswith("CW") and "(" in n):
+        return "CW"
+    if "FOX SPORTS 1" in n or "FS1" in n: return "FOX SPORTS 1 USA"
+    if "FOX SPORTS 2" in n or "FS2" in n: return "FOX SPORTS 2 USA"
+    if "ESPN 2" in n or "ESPN2" in n: return "ESPN 2 USA"
+    if "ESPN" in n: return "ESPN USA"
+    if "BTN" in n: return "BTN"
+    if "NBC" in n: return "NBC"
+    return n
 
 def get_numeric_serial_vectorized(df, date_col, time_col):
-    """Calculates Excel-style date serials without the format warning."""
     try:
-        dt = pd.to_datetime(df[date_col], dayfirst=True, errors='coerce', format='%d/%m/%Y')
-        if dt.isna().all():
-            dt = pd.to_datetime(df[date_col], dayfirst=True, errors='coerce')
-
-        tm = pd.to_datetime(df[time_col].astype(str), format='%H:%M:%S', errors='coerce')
-        
+        dt = pd.to_datetime(df[date_col], format='mixed', dayfirst=True, errors='coerce')
+        tm_series = df[time_col].astype(str).str.strip()
+        tm = pd.to_timedelta(tm_series, errors='coerce')
+        if tm.isna().any():
+            tm_dt = pd.to_datetime(tm_series, format='%H:%M:%S', errors='coerce')
+            tm = pd.to_timedelta(tm_dt.dt.strftime('%H:%M:%S'))
         base_date = datetime(1899, 12, 30)
-        date_ints = (dt - base_date).dt.days
-        time_decs = (tm.dt.hour * 3600 + tm.dt.minute * 60 + tm.dt.second) / 86400.0
-        return date_ints + time_decs
+        return ((dt - base_date).dt.days + (tm.dt.total_seconds() / 86400.0)).fillna(0)
     except Exception:
-        return np.nan
-
-def get_duration_decimal(df, duration_col):
-    """Converts a duration string (HH:MM:SS) into a fraction of a day for serial math."""
-    try:
-        tm = pd.to_timedelta(df[duration_col].astype(str), errors='coerce')
-        return tm.dt.total_seconds() / 86400.0
-    except Exception:
-        return 0.0
+        return pd.Series(0, index=df.index)
 
 def clean_val(val):
     if pd.isna(val) or str(val).strip().upper() in ["#N/A", "#REF!", "NAN", "-", ""]:
@@ -100,221 +103,135 @@ def clean_val(val):
     except:
         return 0.0
 
+def format_time_string(val):
+    t = str(val).strip()
+    return t[:5] if len(t) >= 5 else t
+
 async def process_usa_audit_logic_stream(usa_data, export_file, cpm_file, upload_folder):
     timestamp = int(time.time())
-    start_time = time.time()
+    work_dir = upload_folder if os.name == 'nt' else "/tmp"
     
-    is_windows = os.name == 'nt'
-    work_dir = upload_folder if is_windows else "/tmp"
-    
-    yield f"data: [LOG] USA Engine Active. OS: {'Windows' if is_windows else 'Linux/ECS'}\n\n"
-    
-    usa_p = os.path.join(work_dir, f"u_{timestamp}.xlsx")
-    exp_p = os.path.join(work_dir, f"e_{timestamp}.xlsx")
-    cpm_p = os.path.join(work_dir, f"c_{timestamp}.xlsx")
+    yield "data: [LOG] USA Engine Active. Initializing Transparency Audit...\n\n"
+    usa_p, exp_p, cpm_p = [os.path.join(work_dir, f"{x}_{timestamp}.xlsx") for x in ['u','e','c']]
 
-    # 1. Buffering to Disk
     try:
         for f_obj, p in [(usa_data, usa_p), (export_file, exp_p), (cpm_file, cpm_p)]:
-            with open(p, "wb") as f:
-                shutil.copyfileobj(f_obj.file, f)
-        yield "data: [LOG] Step 1/7: Files safely buffered to disk.\n\n"
-    except Exception as e:
-        yield f"data: [ERROR] Disk Write Failure: {str(e)}\n\n"
-        return
+            with open(p, "wb") as f: shutil.copyfileobj(f_obj.file, f)
 
-    # 2. Load USA Data
-    yield "data: [LOG] Step 2/7: Loading USA Data...\n\n"
-    try:
         xl_usa = pd.ExcelFile(usa_p, engine='calamine')
-        target_sheet = next((s for s in xl_usa.sheet_names if "usadata" in s.lower() or "sheet1" in s.lower()), xl_usa.sheet_names[0])
-        needed_indices = [4, 8, 12, 15, 30]
-        
-        df_usa_raw = pd.read_excel(xl_usa, sheet_name=target_sheet, skiprows=5, usecols=needed_indices)
+        df_usa_raw = pd.read_excel(xl_usa, sheet_name=0, skiprows=5)
         xl_usa.close()
-        gc.collect()
+
+        aud_col = next((c for c in df_usa_raw.columns if "Aud Metered" in str(c) and "14+" not in str(c)), None)
+        if not aud_col: aud_col = next((c for c in df_usa_raw.columns if "Estimates" in str(c)), df_usa_raw.columns[-1])
 
         usa_lookup = pd.DataFrame({
-            '_calc_serial': get_numeric_serial_vectorized(df_usa_raw, df_usa_raw.columns[1], df_usa_raw.columns[2]),
-            '_join_chan': df_usa_raw.iloc[:, 0].astype(str).str.strip().str.upper(),
-            '_val_aud': df_usa_raw.iloc[:, 4],
-            '_val_prog': df_usa_raw.iloc[:, 3]
-        }).dropna(subset=['_calc_serial']).sort_values('_calc_serial')
+            'u_start': get_numeric_serial_vectorized(df_usa_raw, 'Date', 'Start'),
+            'u_end': get_numeric_serial_vectorized(df_usa_raw, 'Date', 'End'),
+            '_join_chan': df_usa_raw['TV-Channel'].apply(normalize_channel_name),
+            'rating_aud': df_usa_raw[aud_col],
+            'rating_prog': df_usa_raw['Program Title'],
+            'str_start': df_usa_raw['Start'].apply(format_time_string),
+            'str_end': df_usa_raw['End'].apply(format_time_string)
+        }).dropna(subset=['u_start'])
         
+        usa_lookup.loc[usa_lookup['u_end'] < usa_lookup['u_start'], 'u_end'] += 1.0
+        usa_grouped = {chan: group for chan, group in usa_lookup.groupby('_join_chan')}
+
+        xl_cpm = pd.ExcelFile(cpm_p, engine='calamine')
+        cpm_sheet = next((s for s in xl_cpm.sheet_names if "cpm" in s.lower()), xl_cpm.sheet_names[0])
+        df_cpm = pd.read_excel(xl_cpm, sheet_name=cpm_sheet, skiprows=2)
+        cpm_map = {normalize_channel_name(row.iloc[0]): clean_val(row.iloc[2]) for _, row in df_cpm.iterrows()}
+        xl_cpm.close()
+
+        xl_exp = pd.ExcelFile(exp_p, engine='calamine')
+        df_export = pd.read_excel(xl_exp, skiprows=3)
+        xl_exp.close()
+
+        date_col = next((c for c in df_export.columns if 'start (date)' in str(c).lower()), df_export.columns[5])
+        time_col = next((c for c in df_export.columns if 'start (time)' in str(c).lower()), df_export.columns[6])
+        dur_col = next((c for c in df_export.columns if 'duration' in str(c).lower()), df_export.columns[7])
+        chan_col = next((c for c in df_export.columns if 'channel' in str(c).lower() and 'country' not in str(c).lower()), df_export.columns[2])
+
+        df_export['_original_idx'] = df_export.index
+        df_export['e_start'] = get_numeric_serial_vectorized(df_export, date_col, time_col)
+        tm_dur = pd.to_timedelta(df_export[dur_col].astype(str), errors='coerce')
+        df_export['e_end'] = df_export['e_start'] + (tm_dur.dt.total_seconds() / 86400.0).fillna(0)
+        df_export['_join_chan'] = df_export[chan_col].apply(normalize_channel_name)
+
+        def find_best_rating(row):
+            chan = row['_join_chan']
+            default_out = [0.0, "#N/A", "", "", "", "", "", ""]
+            if chan not in usa_grouped: return pd.Series(default_out)
+            
+            cands = usa_grouped[chan]
+            e_s, e_e = row['e_start'], row['e_end']
+            
+            cands = cands[(cands['u_start'] < e_e) & (cands['u_end'] > e_s)]
+            if cands.empty: return pd.Series(default_out)
+            
+            export_text = (str(row.get('event', '')) + " " + str(row.get('matchday', ''))).upper()
+            export_keywords = set(re.findall(r'\b\w{3,}\b', export_text))
+            
+            best_score = -999999
+            best_row = None
+            cand_list = []
+            final_reason = ""
+            
+            for _, c in cands.iterrows():
+                prog_name = str(c['rating_prog']).upper()
+                usa_keywords = set(re.findall(r'\b\w{3,}\b', prog_name))
+                overlap_sec = max(0, (min(e_e, c['u_end']) - max(e_s, c['u_start'])) * 86400.0)
+                kw_match_count = len(export_keywords.intersection(usa_keywords))
+                
+                score = (overlap_sec / 60.0) * 10 
+                score += (kw_match_count * 5000)   
+                score -= abs(c['u_start'] - e_s) * 500
+                
+                cand_str = f"{c['str_start']} to {c['str_end']} - {c['rating_prog']} (Aud: {clean_val(c['rating_aud'])})"
+                cand_list.append(cand_str)
+                
+                if score > best_score:
+                    best_score = score
+                    best_row = c
+                    final_reason = f"Matched via {kw_match_count} keywords and {int(overlap_sec/60)} mins overlap."
+            
+            c_cols = (cand_list + [""] * 4)[:4]
+            if best_row is not None:
+                sel_str = f"{best_row['str_start']} to {best_row['str_end']} - {best_row['rating_prog']}"
+                return pd.Series([clean_val(best_row['rating_aud']), best_row['rating_prog'], 
+                                 c_cols[0], c_cols[1], c_cols[2], c_cols[3], sel_str, final_reason])
+            return pd.Series(default_out)
+
+        df_export[['_val_aud', '_val_prog', 'Candidate 1', 'Candidate 2', 'Candidate 3', 'Candidate 4', 'Selected Match Details', '_match_logic']] = df_export.apply(find_best_rating, axis=1)
+
+        def finalize(row):
+            aud = row['_val_aud']
+            cpm = clean_val(cpm_map.get(row['_join_chan'], 0))
+            rate = (aud * cpm) / (30 * 1.31)
+            
+            logic_expl = (f"Chosen USA program '{row['Program check']}' matches the export window. "
+                          f"Logic: {row['_match_logic']} Rate calculated as: "
+                          f"({aud} Aud * {cpm} CPM) / (30s * 1.31 Exch) = {round(rate, 3)} EUR.")
+            
+            return pd.Series([aud, round(rate, 3), row['_val_prog'], "No", cpm, logic_expl])
+
+        df_export[["aud_all_esti (000's)", "1sec Nielsen Rate in EUR", "Program check", "Internal Overlap", "Applied CPM", "Logic Explanation"]] = df_export.apply(finalize, axis=1)
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            cols_to_drop = ['_original_idx', 'e_start', 'e_end', '_join_chan', '_val_aud', '_val_prog', '_match_logic']
+            df_export.sort_values('_original_idx').drop(columns=cols_to_drop, errors='ignore').to_excel(writer, sheet_name='Calculated Export', index=False)
+        
+        output.seek(0)
+        yield "data: [COMPLETED] Success! Audit logs and CPM column added.\n\n"
+        yield f"file: {base64.b64encode(output.read()).decode('utf-8')}\n\n"
     except Exception as e:
-        yield f"data: [ERROR] Failed to process USA file: {str(e)}\n\n"
-        return
-
-    # 3. Load CPM Lookups
-    yield "data: [LOG] Step 3/7: Extracting CPM and Platform mappings...\n\n"
-    xl_cpm = pd.ExcelFile(cpm_p, engine='calamine')
-    
-    cpm_sheet = next((s for s in xl_cpm.sheet_names if "cpm data" in s.lower()), None)
-    df_cpm = pd.read_excel(xl_cpm, sheet_name=cpm_sheet, skiprows=2) if cpm_sheet else pd.DataFrame()
-    cpm_map = {}
-    if not df_cpm.empty:
-        df_cpm.rename(columns={df_cpm.columns[0]: 'DMA'}, inplace=True)
-        demo_col = f"{datetime.now().month}P2+"
-        actual_col = demo_col if demo_col in df_cpm.columns else df_cpm.columns[1]
-        cpm_map = df_cpm.set_index('DMA')[actual_col].to_dict()
-
-    yt_lookup, pck_lookup = {}, {}
-    yt_sheet = next((s for s in xl_cpm.sheet_names if "youtube" in s.lower()), None)
-    if yt_sheet:
-        df_yt = pd.read_excel(xl_cpm, sheet_name=yt_sheet)
-        for _, r in df_yt.iterrows():
-            mday = str(r.iloc[12]).strip().lower()
-            tvm, dur = clean_val(r.iloc[14]), clean_val(r.iloc[15])
-            est_aud = round((tvm / dur) / 1000, 3) if dur != 0 else 0
-            yt_lookup[mday] = {'aud': est_aud, 'rate': round((est_aud * 10.66 / 30) / 1.31, 2)}
-
-    pck_sheet = next((s for s in xl_cpm.sheet_names if "peacock" in s.lower()), None)
-    if pck_sheet:
-        df_pck = pd.read_excel(xl_cpm, sheet_name=pck_sheet)
-        pck_lookup = {str(r.iloc[0]).strip().lower(): clean_val(r.iloc[1]) / 1.31 for _, r in df_pck.iterrows()}
-
-    xl_cpm.close()
-    del df_cpm
-    gc.collect()
-
-    # 4. Process Export Data & FIND INTERNAL OVERLAPS
-    yield "data: [LOG] Step 4/7: Scanning Export file for internal overlaps...\n\n"
-    xl_exp = pd.ExcelFile(exp_p, engine='calamine')
-    df_export = pd.read_excel(xl_exp, skiprows=3)
-    xl_exp.close()
-    
-    df_export['_original_idx'] = df_export.index
-    df_export['_calc_serial'] = get_numeric_serial_vectorized(df_export, 'progr. start (date)', 'progr. start (time)')
-    df_export['_duration_dec'] = get_duration_decimal(df_export, 'progr. duration')
-    df_export['_export_end_serial'] = df_export['_calc_serial'] + df_export['_duration_dec']
-    df_export['_join_chan'] = df_export['channel'].astype(str).str.strip().str.upper().apply(lambda x: CHANNEL_MAPPING.get(x, x))
-    
-    df_export['_date_int'] = df_export['_calc_serial'].fillna(0).astype(int)
-    df_export['Internal Overlap'] = "No"
-    
-    # NEW LOGIC: Text-based explicit overlap flagging
-    if 'matchday' in df_export.columns:
-        # Matches if the string ends with a word boundary followed by rd or rdc
-        text_mask = df_export['matchday'].astype(str).str.strip().str.lower().str.contains(r'\b(rd|rdc)$', regex=True, na=False)
-        df_export['_explicit_subsegment'] = text_mask
-    else:
-        df_export['_explicit_subsegment'] = False
-    
-    # 30 minutes converted to Excel days
-    buffer_dec = 30.0 / 1440.0 
-    
-    grouped = df_export.groupby(['_join_chan', '_date_int'])
-    for _, group in grouped:
-        group = group.sort_values('_duration_dec', ascending=False)
-        main_intervals = []
-        
-        for idx, row in group.iterrows():
-            start = row['_calc_serial']
-            end = row['_export_end_serial']
-            
-            # Short-circuit: If text logic flagged it as RD/RDC, mark as overlap and skip math
-            if row['_explicit_subsegment']:
-                df_export.at[idx, 'Internal Overlap'] = "Yes"
-                continue
-            
-            is_overlap = False
-            for m_start, m_end in main_intervals:
-                if start < (m_end + buffer_dec) and end > (m_start - buffer_dec):
-                    is_overlap = True
-                    break
-                    
-            if is_overlap:
-                df_export.at[idx, 'Internal Overlap'] = "Yes"
-            else:
-                main_intervals.append((start, end))
-    # --- THE FIX: Clean nulls out of the merge keys so Pandas doesn't panic ---
-    
-    # 1. Force the time serial to be a strict number and fill any blanks with 0
-    df_export['_calc_serial'] = pd.to_numeric(df_export['_calc_serial'], errors='coerce').fillna(0)
-    
-    # 2. Find whatever column you are using in your "by=" parameter (e.g., 'Network', 'Channel')
-    # and fill any blanks with "UNKNOWN" so it doesn't crash. 
-    # Example:
-    # df_export['Network'] = df_export['Network'].fillna('UNKNOWN')
-
-    # Merge with USA Data
-    merged = pd.merge_asof(
-        df_export.sort_values('_calc_serial'), 
-        usa_lookup.sort_values('_calc_serial'), 
-        on='_calc_serial', 
-        by='_join_chan', 
-        direction='backward'
-    )
-    merged = merged.sort_values('_original_idx')
-
-    del usa_lookup
-    del df_export
-    gc.collect()
-
-    # 5. Final Audit Calculations
-    yield "data: [LOG] Step 5/7: Finalizing row-level audit calculations...\n\n"
-    def finalize(row):
-        chan_upper = str(row['_join_chan']).upper()
-        mday = str(row.get('matchday', '')).strip().lower()
-        is_internal_overlap = row['Internal Overlap'] == "Yes"
-        
-        if "YOUTUBE" in chan_upper and mday in yt_lookup:
-            rate = 0.0 if is_internal_overlap else yt_lookup[mday]['rate']
-            return pd.Series([yt_lookup[mday]['aud'], rate, "YouTube Match", row['Internal Overlap']])
-            
-        if "PEACOCK" in chan_upper and mday in pck_lookup:
-            rate = 0.0 if is_internal_overlap else round(pck_lookup[mday], 3)
-            return pd.Series([0.0, rate, "Peacock Match", row['Internal Overlap']])
-            
-        aud = clean_val(row['_val_aud'])
-        cpm = clean_val(cpm_map.get(chan_upper, 0))
-        
-        rate = round((aud * cpm) / 30 / 1.31, 3)
-        if is_internal_overlap:
-            rate = 0.0
-            
-        return pd.Series([aud, rate, row['_val_prog'] if pd.notna(row['_val_prog']) else "#N/A", row['Internal Overlap']])
-
-    merged[["aud_all_esti (000's)", "1sec Nielsen Rate in EUR", "Program check", "Internal Overlap Flag"]] = merged.apply(finalize, axis=1)
-
-    # 6. Generate Output
-    yield "data: [LOG] Step 6/7: Generating final Excel buffer...\n\n"
-    output = io.BytesIO()
-    
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        # Drop the temporary text-check column so it doesn't clutter the final excel
-        if '_explicit_subsegment' in merged.columns:
-            merged = merged.drop(columns=['_explicit_subsegment'])
-            
-        merged.to_excel(writer, sheet_name='Calculated Export', index=False)
-        
-        df_overlaps = merged[merged["Internal Overlap Flag"] == "Yes"].sort_values('channel')
-        if not df_overlaps.empty:
-            df_overlaps.to_excel(writer, sheet_name='Overlapped Line Items', index=False)
-            
-        df_usa_raw.to_excel(writer, sheet_name='USA Data Reference', index=False)
-    
-    # 7. Final Stream Encoding
-    yield "data: [LOG] Step 7/7: Creating download stream...\n\n"
-    del merged
-    gc.collect()
-    
-    output.seek(0)
-    file_bytes = output.read()
-    output.close()
-    base64_file = base64.b64encode(file_bytes).decode('utf-8')
-    del file_bytes
-    gc.collect()
-
-    duration = round(time.time() - start_time, 2)
-    yield f"data: [COMPLETED] Success! Audit took {duration}s.\n\n"
-    yield f"file: {base64_file}\n\n"
-
-    time.sleep(1)
-    for p in [usa_p, exp_p, cpm_p]:
-        try:
+        yield f"data: [ERROR] {str(e)}\n\n"
+    finally:
+        for p in [usa_p, exp_p, cpm_p]:
             if os.path.exists(p): os.remove(p)
-        except: pass
+        gc.collect()
         
 # import os
 # import time

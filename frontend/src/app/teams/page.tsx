@@ -1,56 +1,72 @@
 // "use client";
-// import { useGetTeamsQuery } from "@/state/api";
-// import React from "react";
+
+// import React, { useState, useRef } from "react";
 // import { useAppSelector } from "../redux";
 // import Header from "@/components/Header";
-// import {
-//   DataGrid,
-//   GridColDef,
-//   GridToolbarContainer,
-//   GridToolbarExport,
-//   GridToolbarFilterButton,
-// } from "@mui/x-data-grid";
-// import { dataGridClassNames, dataGridSxStyles } from "@/lib/utils";
-
-// const CustomToolbar = () => (
-//   <GridToolbarContainer className="toolbar flex gap-2">
-//     <GridToolbarFilterButton />
-//     <GridToolbarExport />
-//   </GridToolbarContainer>
-// );
-
-// const columns: GridColDef[] = [
-//   { field: "id", headerName: "Team ID", width: 100 },
-//   { field: "teamName", headerName: "Team Name", width: 200 },
-//   { field: "productOwnerUsername", headerName: "Product Owner", width: 200 },
-//   {
-//     field: "projectManagerUsername",
-//     headerName: "Project Manager",
-//     width: 200,
-//   },
-// ];
+// import { 
+//   ShieldAlert,
+//   Search, 
+//   ZoomIn, 
+//   ZoomOut,
+//   Lock
+// } from "lucide-react";
 
 // const Teams = () => {
-//   const { data: teams, isLoading, isError } = useGetTeamsQuery();
 //   const isDarkMode = useAppSelector((state) => state.global.isDarkMode);
-
-//   if (isLoading) return <div>Loading...</div>;
-//   if (isError || !teams) return <div>Error fetching teams</div>;
+//   const [zoom, setZoom] = useState(0.6);
+//   const [searchTerm, setSearchTerm] = useState("");
+  
+//   // Logic kept for structural consistency
+//   const handleZoomIn = () => setZoom((prev) => Math.min(prev + 0.05, 2));
+//   const handleZoomOut = () => setZoom((prev) => Math.max(prev - 0.05, 0.2));
 
 //   return (
-//     <div className="flex w-full flex-col p-8">
-//       <Header name="Teams" />
-//       <div style={{ height: 650, width: "100%" }}>
-//         <DataGrid
-//           rows={teams || []}
-//           columns={columns}
-//           pagination
-//           slots={{
-//             toolbar: CustomToolbar,
-//           }}
-//           className={dataGridClassNames}
-//           sx={dataGridSxStyles(isDarkMode)}
-//         />
+//     <div className={`flex w-full flex-col p-8 min-h-screen transition-colors duration-300 ${isDarkMode ? "bg-dark-bg text-white" : "bg-gray-50 text-gray-900"}`}>
+      
+//       {/* HEADER SECTION */}
+//       <div className="flex flex-col md:flex-row justify-between items-center mb-6 gap-6">
+//         <Header name="Master Organization Chart" />
+//         <div className="flex items-center gap-4 opacity-40 pointer-events-none">
+//           <div className="relative">
+//             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
+//             <input 
+//               type="text" placeholder="Search..." disabled
+//               className={`pl-10 pr-4 py-2 rounded-lg border text-sm w-72 ${isDarkMode ? "bg-gray-800 border-gray-700 text-white" : "bg-white border-gray-300 text-black"}`}
+//             />
+//           </div>
+//           <div className={`flex items-center gap-2 p-1.5 rounded-lg border ${isDarkMode ? "bg-gray-800 border-gray-700" : "bg-white border-gray-300"}`}>
+//             <button className="p-1"><ZoomOut className="w-4 h-4"/></button>
+//             <span className="text-xs font-bold w-12 text-center select-none">{Math.round(zoom * 100)}%</span>
+//             <button className="p-1"><ZoomIn className="w-4 h-4"/></button>
+//           </div>
+//         </div>
+//       </div>
+
+//       {/* SECURITY NOTICE AREA */}
+//       <div className={`flex-1 flex flex-col items-center justify-center rounded-xl border-2 transition-colors duration-300 ${isDarkMode ? "border-red-900/40 bg-black/40" : "border-red-100 bg-white shadow-inner"}`}>
+//         <div className="text-center p-10 flex flex-col items-center">
+//           {/* Static Icon - No Animation */}
+//           <div className={`p-5 rounded-2xl mb-6 border-2 ${isDarkMode ? "bg-red-950/30 border-red-900/50 text-red-500" : "bg-red-50 border-red-100 text-red-600"}`}>
+//             <ShieldAlert size={64} strokeWidth={1.5} />
+//           </div>
+          
+//           <h2 className="text-3xl font-black uppercase tracking-tight mb-3">Access Restricted</h2>
+          
+//           <div className={`flex items-center gap-2 mb-6 px-4 py-1.5 rounded-full border ${isDarkMode ? "bg-red-900/10 border-red-900/40 text-red-400" : "bg-red-50 border-red-200 text-red-700"}`}>
+//             <Lock size={14} />
+//             <span className="text-[11px] font-bold uppercase tracking-widest">Protocol 403-Secure</span>
+//           </div>
+
+//           <p className={`text-sm font-medium max-w-md leading-relaxed ${isDarkMode ? "text-gray-500" : "text-gray-500"}`}>
+//             This page has currently down. 
+//           </p>
+//         </div>
+//       </div>
+
+//       {/* FOOTER */}
+//       <div className="mt-8 pt-6 border-t border-gray-500/10 flex justify-between items-center opacity-40">
+//         <span className="text-[10px] font-mono tracking-tighter">NODE_STATUS: OFFLINE</span>
+//         <span className="text-[10px] font-bold uppercase tracking-[0.2em]">Security Clearance Required</span>
 //       </div>
 //     </div>
 //   );

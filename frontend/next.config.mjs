@@ -1,7 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: "standalone",   // <--- required for Dockerfile
+  output: "standalone",
   images: {
+    unoptimized: true, 
     remotePatterns: [
       {
         protocol: "https",

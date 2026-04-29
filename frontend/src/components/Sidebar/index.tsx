@@ -245,7 +245,9 @@ import {
   List,
   ListCheckIcon,
   ClipboardList,
-  ClipboardPen
+  ClipboardPen,
+  CircleGauge,
+  Activity
 } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -330,6 +332,16 @@ const Sidebar = () => {
 
           {showDashboards && (
             <>
+              <SidebarLink
+                icon={CircleGauge}
+                label="GMS Dashboard"
+                href="/gms-dashboard"
+              />
+              <SidebarLink
+                icon={Activity}
+                label="Audit Trail"
+                href="/qc-history"
+              />
               <SidebarButton
                 icon={LayoutDashboard}
                 label="Data Comparison"
@@ -340,6 +352,7 @@ const Sidebar = () => {
                 label="BSA Early Warning"
                 href="/dashboards/early-warning"
               />
+              
             </>
           )}
 
@@ -364,7 +377,7 @@ const Sidebar = () => {
               />
               <SidebarLink
                 icon={ListCheckIcon}
-                label="MM Checks"
+                label="E2E Checks"
                 href="/priority/mm-bsa"
               />
             </>

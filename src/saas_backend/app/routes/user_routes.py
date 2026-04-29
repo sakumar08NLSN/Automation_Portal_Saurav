@@ -1,8 +1,11 @@
 # DASHBOARD_BACKEND/app/routes/user_routes.py
 
-from fastapi import APIRouter, HTTPException, Path
+from fastapi import APIRouter, HTTPException, Path,Depends
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any
+from sqlalchemy.orm import Session
+from database import get_db
+from core.users.models import User as DBUser
 
 # --- Pydantic Models ---
 
@@ -69,19 +72,43 @@ async def get_users():
         raise HTTPException(status_code=500, detail=f"Error retrieving users: {e}")
 
 # 2. GET /users/{cognito_id} (Equivalent to router.get("/:cognitoId", getUser))
-@router.get("/{cognito_id}", response_model=Optional[User], tags=["Users"])
-async def get_user(cognito_id: str):
+@router.get("/{okta_uid}", tags=["Users"])
+async def get_user(okta_uid: str, db: Session = Depends(get_db)):
     """
-    Simulates User.findUnique({ where: { cognitoId } }) and returns a single user.
+    Fetches a user from PostgreSQL using their Okta ID. 
+    If they don't exist, it automatically registers them!
     """
     try:
-        # Simulate finding a unique record by cognitoId
-        user = next((u for u in DUMMY_USERS if u.cognito_id == cognito_id), None)
+        # 1. Query the REAL PostgreSQL database using DBUser (SQLAlchemy)
+        user = db.query(DBUser).filter(DBUser.okta_uid == okta_uid).first()
         
-        # FastAPI handles returning the object or None correctly based on response_model
-        return user
+        # 2. If it's a brand new Okta user, insert them into the DB
+        if not user:
+            new_user = DBUser(
+                okta_uid=okta_uid,
+                email=f"{okta_uid}@placeholder.nielsen.com", 
+                first_name="Nielsen",
+                last_name="User",
+                is_active=True
+            )
+            db.add(new_user)
+            db.commit()
+            db.refresh(new_user)
+            
+            user = new_user
+
+        # 3. Return the data in the exact JSON format your React frontend expects
+        return {
+            "userId": user.okta_uid,       
+            "username": f"{user.first_name} {user.last_name}",
+            "profilePictureUrl": "i1.jpg", 
+            "teamId": 1                    
+        }
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving user: {e}")
+        # If anything crashes, it undoes the database transaction and tells you EXACTLY why
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database Error: {str(e)}")
 
 # 3. POST /users (Equivalent to router.post("/", postUser))
 @router.post("/", response_model=dict[str, Any], status_code=200, tags=["Users"])

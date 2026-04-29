@@ -7,6 +7,14 @@ import io
 import base64
 import gc
 
+# --- STEP 1: LEGACY OVERRIDES ---
+# Markets that completely ignore CPM logic in the legacy system
+FORCE_EURO_MARKETS = []
+# Channels that must go to EURO regardless of other parameters
+FORCE_EURO_CHANNELS = ['Sport TV 1', 'Sport TV +']
+# REMOVED the Force Ratecard override so it calculates true CPT when Audience > 0
+FORCE_RATECARD_CHANNELS = ['Colors Cineplex']
+
 # --- STEP 1 HARDCODED MAPPING ---
 # We will replace this with an actual mapping file in later steps if needed
 HARDCODED_MODEL_MAP = {
@@ -2601,52 +2609,7 @@ HARDCODED_REGION_MAP = {
     "United Kingdom": "Europe", "Ukraine": "Europe", "USA": "North America",
     "Vietnam": "Asia Pacific"
 }
-# --- 2. UTILITY FUNCTIONS ---
-def clean_val(val):
-    if pd.isna(val) or str(val).strip().upper() in ["#N/A", "#REF!", "NAN", "-", "X", ""]:
-        return 0.0
-    try:
-        return float(str(val).replace('$', '').replace(',', '').strip())
-    except:
-        return 0.0
 
-def get_excel_date_string(date_series):
-    if pd.api.types.is_numeric_dtype(date_series):
-        return date_series.fillna(0).astype(int).astype(str)
-    
-    dt = pd.to_datetime(date_series, dayfirst=True, errors='coerce')
-    base_date = pd.Timestamp('1899-12-30')
-    serials = (dt - base_date).dt.days
-    return np.where(serials.isna(), date_series.astype(str), serials.fillna(0).astype(int).astype(str))
-
-# --- 3. CALCULATION ENGINES ---
-def simulate_cpm_macro_calculation(df_cpm, df_cpt_list, debug_logs):
-    """Calculates the 1sec Repucom Rate for CPM Models."""
-    col_est = "Estimated Aud. All Individuals (in 000's)"
-    col_off = "Official Aud. All Individuals (in 000's)"
-    
-    aud_estimates = pd.to_numeric(df_cpm.get(col_est, pd.Series()), errors='coerce')
-    aud_official = pd.to_numeric(df_cpm.get(col_off, pd.Series()), errors='coerce')
-    
-    final_aud = aud_estimates.fillna(aud_official).fillna(0.0)
-    df_cpm['Final_Audience'] = (final_aud * 1000).round() / 1000
-
-    debug_logs.append(f"[DEBUG-CPM] CPM Audience -> Est: {aud_estimates.iloc[0]}, Official: {aud_official.iloc[0]} | Picked: {final_aud.iloc[0]}")
-
-    mat_id = df_cpm['MAT Country ID'].astype(str).str.replace(r'\.0$', '', regex=True).str.replace('nan', '0', case=False)
-    chan_id = df_cpm['Channel ID'].astype(str).str.replace(r'\.0$', '', regex=True).str.replace('nan', '0', case=False)
-    
-    df_cpm['lookup_key'] = mat_id + "-" + chan_id + " - Latest"
-    debug_logs.append(f"[DEBUG-CPM] Search Key: '{df_cpm['lookup_key'].iloc[0]}'")
-
-    merged = pd.merge(df_cpm, df_cpt_list[['Latest / Old', 'Channel CPM in € per 30 sec.']], left_on='lookup_key', right_on='Latest / Old', how='left')
-    
-    matched_cpm = pd.to_numeric(merged['Channel CPM in € per 30 sec.'], errors='coerce')
-    debug_logs.append(f"[DEBUG-CPM] Matches Found: {matched_cpm.notna().sum()} out of {len(df_cpm)} rows.")
-
-    df_cpm['Calculated_1sec_Rate'] = (df_cpm['Final_Audience'] * matched_cpm.fillna(0.0)) / 30
-    return df_cpm
-# --- 2. UTILITY FUNCTIONS ---
 # --- 2. UTILITY FUNCTIONS ---
 def safe_pct(val):
     if pd.isna(val): return 0.0
@@ -2658,23 +2621,22 @@ def safe_pct(val):
     except: return 0.0
 
 def get_global_val(df, search_term, default_val):
+    search_clean = str(search_term).lower().replace(" ", "").replace("?", "")
     try:
         for col_idx in range(len(df.columns)):
-            clean_col = df.iloc[:, col_idx].astype(str).str.strip().str.lower()
-            mask = (clean_col == search_term.lower())
+            clean_col = df.iloc[:, col_idx].astype(str).str.lower().str.replace(r'[^a-z0-9]', '', regex=True)
+            mask = (clean_col == search_clean)
             if mask.any():
                 row_idx = np.where(mask)[0][0]
                 if col_idx + 1 < len(df.columns):
-                    return df.iloc[row_idx, col_idx + 1]
+                    val = df.iloc[row_idx, col_idx + 1]
+                    if pd.notna(val) and str(val).strip() not in ["", "nan", "None"]:
+                        return val
     except: pass
     return default_val
 
 def get_daypart_lookup(df, dayparts_df):
     return np.where((df['Hour'] >= 18) & (df['Hour'] < 23), "Prime", "Non-Prime")
-
-def clean_str_col(series):
-    if series is None: return pd.Series('')
-    return series.fillna('').astype(str).str.strip().str.replace(r'(?i)^nan$', '', regex=True)
 
 def extract_weighting_tables(w_df):
     tables = {'spot': None, 'cpt': None, 'repeats': None}
@@ -2740,20 +2702,22 @@ def process_ref_table(df):
     df.iloc[:, 0] = df.iloc[:, 0].astype(str).str.strip().str.lower()
     return df.set_index(df.columns[0])
 
-
-# --- 3. CALCULATION ENGINES ---
-def simulate_cpm_macro_calculation(df_cpm, df_cpt_list, debug_logs):
-    pass # Inline in orchestrator
-
-def simulate_euro_macro_calculation(df_euro, euro_refs, debug_logs):
+# --- 3. EURO ENGINE ---
+def simulate_euro_macro_calculation(df_euro, euro_refs, sport_genre, spot_fixture, debug_logs):
     w_df = euro_refs.get('weightings_raw')
+    
+    try:
+        frontend_floor = float(spot_fixture) / 100.0
+    except:
+        frontend_floor = 0.0
+
     if w_df is not None and not w_df.empty:
         rg_prime_adj = safe_pct(get_global_val(w_df, 'RgPrimeAdj?', 1.0))
-        rg_cpt_floor_factor = safe_pct(get_global_val(w_df, 'RgCPTFloorFactor', 0.5))
+        rg_cpt_floor_factor = frontend_floor 
         limit_duration = str(get_global_val(w_df, 'LimitDuration', 'No')).strip().lower() == 'yes'
         use_repeat_discount = str(get_global_val(w_df, 'Use Repeat Discount', 'No')).strip().lower() == 'yes'
     else:
-        rg_prime_adj, rg_cpt_floor_factor, limit_duration, use_repeat_discount = 1.0, 0.5, False, False
+        rg_prime_adj, rg_cpt_floor_factor, limit_duration, use_repeat_discount = 1.0, frontend_floor, False, False
 
     df_euro['Region'] = df_euro['channel country'].map(HARDCODED_REGION_MAP)
     df_euro['Market'] = df_euro['channel country'].astype(str).str.strip()
@@ -2761,73 +2725,117 @@ def simulate_euro_macro_calculation(df_euro, euro_refs, debug_logs):
     df_euro['Channel'] = df_euro['channel'].astype(str).str.strip()
     
     df_euro['Date'] = pd.to_datetime(df_euro['progr. start (date)'], errors='coerce')
-    df_euro['Start'] = pd.to_datetime(df_euro['progr. start (time)'].astype(str), errors='coerce')
-    df_euro['End'] = pd.to_datetime(df_euro.get('progr. end (time)', df_euro['Start']).astype(str), errors='coerce')
+    df_euro['Start'] = pd.to_datetime(df_euro['progr. start (time)'].astype(str), format='mixed', errors='coerce')
+    df_euro['End'] = pd.to_datetime(df_euro.get('progr. end (time)', df_euro['Start']).astype(str), format='mixed', errors='coerce')
     df_euro['Hour'] = df_euro['Start'].dt.hour
-    
     df_euro['Program Type'] = df_euro['programme category'].astype(str).str.strip()
     
-    df_euro['SportGenre'] = df_euro.get('sports', pd.Series('Football', index=df_euro.index)).astype(str).str.strip()
+    df_euro['SportGenre'] = df_euro.get('sports', pd.Series(sport_genre, index=df_euro.index)).replace("", sport_genre).fillna(sport_genre).astype(str).str.strip()
     df_euro['SportColumn'] = df_euro['SportGenre']
     
-    aud_est_col = next((c for c in df_euro.columns if 'estimat' in c.lower() and 'aud' in c.lower()), "Aud. Estimates ['000s]")
-    aud_off_col = next((c for c in df_euro.columns if ('official' in c.lower() or 'metered' in c.lower()) and 'aud' in c.lower()), "Aud Metered (000s) 3+")
-    
-    df_euro["Aud. Estimates ['000s]"] = pd.to_numeric(df_euro.get(aud_est_col, pd.Series(np.nan, index=df_euro.index)).astype(str).str.replace(',', ''), errors='coerce')
-    df_euro['Aud Metered (000s) 3+'] = pd.to_numeric(df_euro.get(aud_off_col, pd.Series(np.nan, index=df_euro.index)).astype(str).str.replace(',', ''), errors='coerce')
+    df_euro['Frontend_Spot_Rate'] = spot_fixture
+
+    df_euro['Aud Metered (000s) 3+'] = df_euro.get('Aud Metered', pd.Series(np.nan, index=df_euro.index))
+    df_euro['Combined_Audience'] = df_euro.get('Final_Aud_Check', pd.Series(0.0, index=df_euro.index))
+
+    rating_col = next((c for c in df_euro.columns if 'rate/rating country' in str(c).lower()), None)
+    if rating_col:
+        r_country = df_euro[rating_col].astype(str).str.strip().str.lower()
+        c_country = df_euro['Market'].astype(str).str.strip().str.lower()
+        
+        mismatch_mask = (r_country != "") & (r_country != "nan") & (r_country != c_country)
+        df_euro['Aud Metered (000s) 3+'] = np.where(mismatch_mask, np.nan, df_euro['Aud Metered (000s) 3+'])
+        df_euro['Combined_Audience'] = np.where(mismatch_mask, 0.0, df_euro['Combined_Audience'])
 
     duration_delta = df_euro['End'] - df_euro['Start']
     duration_delta = np.where(duration_delta.dt.total_seconds() < 0, duration_delta + pd.Timedelta(days=1), duration_delta)
     df_euro['Duration Check'] = duration_delta
-
     df_euro['Country'] = df_euro['Market']
     
-    # ---------------------------------------------------------
-    # THE FIX: Strip ' NZL' from the end of the channel so it maps!
-    # ---------------------------------------------------------
-    df_euro['FixedChannel'] = df_euro['Channel'].str.split('(').str[0].str.replace(r'(?i)\s*nzl$', '', regex=True).str.strip()
-    df_euro['CountryFixedChannel'] = df_euro['Country'] + df_euro['FixedChannel']
+    df_euro['merge_key_raw'] = (df_euro['Country'] + df_euro['Channel'].str.split('(').str[0].str.strip()).astype(str).str.lower().str.replace(r'[^a-z0-9\+]', '', regex=True)
+    df_euro['FixedChannel'] = df_euro['Channel'].str.split('(').str[0].str.replace(r'(?i)\s*(ARG|MENA|USA|NZL|PAN-AFRICA|AFRICA)$', '', regex=True).str.strip()
+    df_euro['merge_key_stripped'] = (df_euro['Country'] + df_euro['FixedChannel']).astype(str).str.lower().str.replace(r'[^a-z0-9\+]', '', regex=True)
 
     df_country = euro_refs.get('country_table')
-    df_euro['merge_key'] = df_euro['CountryFixedChannel'].astype(str).str.lower().str.replace(r'[^a-z0-9]', '', regex=True)
+    unfound_channels = set()
 
     if df_country is not None and not df_country.empty:
         df_country.columns = df_country.columns.astype(str).str.strip().str.lower()
         if 'country' in df_country.columns and 'channel' in df_country.columns:
             euro_country = df_country['country'].astype(str).str.strip()
             euro_channel = df_country['channel'].astype(str).str.split('(').str[0].str.strip()
-            df_country['merge_key'] = (euro_country + euro_channel).str.lower().str.replace(r'[^a-z0-9]', '', regex=True)
+            df_country['lookup_id'] = (euro_country + euro_channel).str.lower().str.replace(r'[^a-z0-9\+]', '', regex=True)
         else:
-            df_country['merge_key'] = df_country.iloc[:, 0].astype(str).str.lower().str.replace(r'[^a-z0-9]', '', regex=True)
+            df_country['lookup_id'] = df_country.iloc[:, 0].astype(str).str.lower().str.replace(r'[^a-z0-9\+]', '', regex=True)
         
-        df_country_unique = df_country.drop_duplicates(subset=['merge_key']).set_index('merge_key')
+        df_country_unique = df_country.drop_duplicates(subset=['lookup_id']).set_index('lookup_id')
         
         def fetch_dynamic_spot(row):
-            key = row.get('merge_key', '')
-            sport = str(row.get('SportColumn', 'football')).strip().lower()
-            try:
-                val = df_country_unique.loc[key, sport]
-                if isinstance(val, pd.Series): val = val.iloc[0]
-                # Strip commas from reference data before converting to decimal
-                return pd.to_numeric(str(val).replace(',', ''), errors='coerce')
-            except: return 0.0
+            k1, k2 = row.get('merge_key_raw', ''), row.get('merge_key_stripped', '')
+            
+            # --- TRACKING MISSING CHANNELS ---
+            if k1 not in df_country_unique.index and k2 not in df_country_unique.index:
+                unfound_channels.add(f"{row.get('Country', 'Unknown')} - {row.get('Channel', 'Unknown')}")
+                return 0.0
+            
+            sports_to_try = [
+                str(row.get('SportColumn')).strip().lower(),
+                str(row.get('_original_sport', 'football')).strip().lower(),
+                'football'
+            ]
+            
+            for s in sports_to_try:
+                for k in [k1, k2]:
+                    try:
+                        val = df_country_unique.loc[k, s]
+                        if isinstance(val, pd.Series): val = val.iloc[0]
+                        v = pd.to_numeric(str(val).replace(',', ''), errors='coerce')
+                        if pd.notna(v) and v > 0: return v
+                    except: pass
+            return 0.0
 
         def fetch_dynamic_aud(row):
-            key = row.get('merge_key', '')
-            sport = str(row.get('SportColumn', 'football')).strip().lower()
-            aud_col = f"{sport} audience"
-            try:
-                val = df_country_unique.loc[key, aud_col]
-                if isinstance(val, pd.Series): val = val.iloc[0]
-                # Strip commas from reference data before converting to decimal
-                return pd.to_numeric(str(val).replace(',', ''), errors='coerce')
-            except: return 0.0
+            k1, k2 = row.get('merge_key_raw', ''), row.get('merge_key_stripped', '')
+            sports_to_try = [
+                str(row.get('SportColumn')).strip().lower(),
+                str(row.get('_original_sport', 'football')).strip().lower(),
+                'football'
+            ]
+            
+            for s in sports_to_try:
+                aud_col = f"{s} audience"
+                for k in [k1, k2]:
+                    try:
+                        val = df_country_unique.loc[k, aud_col]
+                        if isinstance(val, pd.Series): val = val.iloc[0]
+                        v = pd.to_numeric(str(val).replace(',', ''), errors='coerce')
+                        if pd.notna(v) and v > 0: return v
+                    except: pass
+            return 0.0
             
         df_euro['SpotRate'] = df_euro.apply(fetch_dynamic_spot, axis=1).fillna(0.0)
         df_euro['PeakTimeAverageAudience'] = df_euro.apply(fetch_dynamic_aud, axis=1).fillna(0.0)
-        df_euro['Missing Channel Test'] = np.where(df_euro['SpotRate'] > 0, "OK", "Missing")
+        
+        # --- NEW: Track Missing Specific Sports ---
+        # The channel exists, but the Spot Rate came back as 0.0 (meaning the cell for that sport was blank)
+        # --- NEW: Track Missing Specific Sports ---
+        zero_spot_mask = (df_euro['SpotRate'] == 0.0) & (~df_euro['merge_key_raw'].isin([k.replace(" - ", "").lower().replace(r'[^a-z0-9\+]', '') for k in unfound_channels]))
+        if zero_spot_mask.any():
+            empty_sport_chans = df_euro[zero_spot_mask]['FixedChannel'].unique()
+            s_list = ', '.join(sorted(empty_sport_chans))
+            debug_logs.append(f"⚠️ MISSING SPORT RATE: Channels [{s_list}] exist in the 'country table rates', but the cell for '{sport_genre}' is blank or 0. This will cause €0.00 rates. Please update your Euro file.")
+
+        # Log completely missing channels to the console
+        if unfound_channels:
+            missing_list = ', '.join(sorted(unfound_channels))
+            friendly_msg = (
+                f"⚠️ ACTION REQUIRED: Found {len(unfound_channels)} channel(s) missing from the 'country table rates' tab in your EURO file: "
+                f"[{missing_list}]. "
+                f"Because they are missing, their calculations will result in €0.00. Please add them to your Euro Macro Excel file to fix this."
+            )
+            debug_logs.append(friendly_msg)
+            # debug_logs.append(f"Missing from 'Country Table Rates': {', '.join(sorted(unfound_channels)[:5])}" + ("... (truncated)" if len(unfound_channels)>5 else ""))
     else:
-        df_euro['Missing Channel Test'] = "Missing Table"
         df_euro['SpotRate'], df_euro['PeakTimeAverageAudience'] = 0.0, 0.0
 
     df_euro['Week Period'] = np.where(df_euro['Date'].dt.dayofweek < 5, "Weekday", "Weekend")
@@ -2836,11 +2844,12 @@ def simulate_euro_macro_calculation(df_euro, euro_refs, debug_logs):
     prog_type_clean = df_euro['Program Type'].astype(str).str.strip().str.lower()
     df_euro['LiveStatus'] = np.where(prog_type_clean.isin(['live', 'sport (live)']), "Live", "Non-Live")
     
-    df_euro['RateSource'] = np.where(df_euro['Aud Metered (000s) 3+'].isna() | (df_euro['Aud Metered (000s) 3+'] == 0), "Ratecard", "CPT")
+    is_force_ratecard = df_euro['FixedChannel'].astype(str).str.strip().str.lower().isin([c.lower() for c in FORCE_RATECARD_CHANNELS])
+    is_metered_blank = df_euro['Aud Metered (000s) 3+'].isna() | (df_euro['Aud Metered (000s) 3+'] <= 0)
+    df_euro['RateSource'] = np.where(is_metered_blank | is_force_ratecard, "Ratecard", "CPT")
 
     df_euro['PhaseFixtureEpisode'] = df_euro.get('PhaseFixtureEpisode', '')
     df_euro['Repeats'] = df_euro.groupby(['Market', 'Broadcaster', 'Program Type', 'PhaseFixtureEpisode']).cumcount() + 1
-    
     df_euro['RepeatDiscount'] = 1.0
     if use_repeat_discount and euro_refs.get('tbl_repeats') is not None:
         rep_dict = euro_refs['tbl_repeats'].iloc[:, 0].apply(safe_pct).to_dict()
@@ -2853,7 +2862,6 @@ def simulate_euro_macro_calculation(df_euro, euro_refs, debug_logs):
     df_euro['Adj_Day'] = lookup_value(df_euro, t_spot, 'Daypart', 'SportColumn')
     df_euro['Adj_Live'] = lookup_value(df_euro, t_spot, 'LiveStatus', 'SportColumn')
     df_euro['Spot Rate Adj for Weekday Prime and Live'] = df_euro['Adj_Week'] * df_euro['Adj_Day'] * df_euro['Adj_Live']
-
     df_euro['SportRateAdjSpot'] = np.where(prog_type_clean == 'news', 1.0, lookup_value(df_euro, euro_refs.get('sport_spot'), 'Country', 'SportColumn'))
 
     df_euro['Adjusted Spot rate'] = df_euro['SpotRate'] * df_euro['Spot Rate Adj for Weekday Prime and Live'] * df_euro['SportRateAdjSpot'] * df_euro['RepeatDiscount']
@@ -2868,46 +2876,35 @@ def simulate_euro_macro_calculation(df_euro, euro_refs, debug_logs):
     df_euro['PrimeTimeAdj'] = np.maximum(lookup_value(df_euro, t_cpt, 'Daypart', 'SportColumn'), rg_prime_adj)
     df_euro['Adjusted CPT'] = df_euro['CPT Adjusted for Sport'] * df_euro['PrimeTimeAdj']
     
-    aud_3_clean = df_euro['Aud Metered (000s) 3+'].fillna(0)
-    df_euro['Value per Second CPT'] = (df_euro['Adjusted CPT'] * aud_3_clean) / 30
+    metered_filled = df_euro['Aud Metered (000s) 3+'].fillna(0.0)
+    df_euro['Value per Second CPT'] = (df_euro['Adjusted CPT'] * metered_filled) / 30
 
     cps_calc = np.where(
         df_euro['RateSource'] == 'Ratecard',
         df_euro['Value per Second Spot Rate'],
         np.maximum(df_euro['Value per Second CPT'], rg_cpt_floor_factor * df_euro['Value per Second Spot Rate'])
     )
+    
     df_euro['CPS Result Spot or CPT'] = np.where(
-        aud_3_clean.notna() & (aud_3_clean > 0) & (df_euro['PeakTimeAverageAudience'] == 0),
-        np.nan, cps_calc
+        (metered_filled > 0) & (df_euro['PeakTimeAverageAudience'] == 0) & (df_euro['RateSource'] == 'CPT'),
+        df_euro['Value per Second Spot Rate'], 
+        cps_calc
     )
-
-    phase_fix = clean_str_col(df_euro.get('PhaseFixtureEpisode', pd.Series(dtype=str)))
-    event_str = clean_str_col(df_euro.get('event', pd.Series(dtype=str)))
-    df_euro['What to lookup in Fixture'] = (phase_fix + event_str).str.strip()
+    
+    df_euro['What to lookup in Fixture'] = df_euro.get('Combined (translated)', pd.Series("", index=df_euro.index)).astype(str).str.strip()
     
     df_euro['Duration Factor'] = 1.0
-    
     df_fixtures = euro_refs.get('fixtures')
     if df_fixtures is not None and not df_fixtures.empty:
         df_fixtures.columns = df_fixtures.columns.astype(str).str.strip()
         fixture_key_col = df_fixtures.columns[0] 
-        df_fixtures_clean = df_fixtures[df_fixtures[fixture_key_col].astype(str).str.strip() != ""]
-        df_fixtures_unique = df_fixtures_clean.drop_duplicates(subset=[fixture_key_col])
-        
+        df_fixtures_unique = df_fixtures[df_fixtures[fixture_key_col].astype(str).str.strip() != ""].drop_duplicates(subset=[fixture_key_col])
         dur_col = next((c for c in df_fixtures_unique.columns if 'duration' in str(c).lower()), None)
         if dur_col:
             dur_dict = df_fixtures_unique.set_index(fixture_key_col)[dur_col].to_dict()
-            df_euro['Fixture_Duration_Raw'] = np.where(
-                df_euro['What to lookup in Fixture'] != "",
-                df_euro['What to lookup in Fixture'].map(dur_dict),
-                np.nan
-            )
+            df_euro['Fixture_Duration_Raw'] = np.where(df_euro['What to lookup in Fixture'] != "", df_euro['What to lookup in Fixture'].map(dur_dict), np.nan)
             fix_dur = pd.to_timedelta(df_euro['Fixture_Duration_Raw'].astype(str), errors='coerce').dt.total_seconds().replace(0, np.nan)
-            df_euro['Duration Factor'] = np.where(
-                fix_dur.notna(),
-                (df_euro['Duration Check'].dt.total_seconds() / fix_dur).fillna(1.0),
-                1.0
-            )
+            df_euro['Duration Factor'] = np.where(fix_dur.notna(), (df_euro['Duration Check'].dt.total_seconds() / fix_dur).fillna(1.0), 1.0)
             
     df_euro['Limited Duration Factor'] = np.where(limit_duration, np.minimum(1.0, df_euro['Duration Factor']), df_euro['Duration Factor'])
 
@@ -2919,29 +2916,16 @@ def simulate_euro_macro_calculation(df_euro, euro_refs, debug_logs):
     df_euro['CPS After Discount and Uplift'] = np.where(df_euro['Override Rate LC'].notna(), df_euro['Override Rate LC'], calc_cps)
     df_euro['CPS Euro'] = np.where(df_euro['CPS Result Spot or CPT'].isna(), np.nan, df_euro['CPS After Discount and Uplift'])
     
-    cols_to_log = [
-        "Channel", "Program Type", "LiveStatus", "RateSource", "SportColumn",
-        "SpotRate", "PeakTimeAverageAudience", "Adj_Week", "Adj_Day", "Adj_Live",
-        "Spot Rate Adj for Weekday Prime and Live", "SportRateAdjSpot",
-        "Value per Second Spot Rate", "Peak Time CPT", "Value per Second CPT", "CPS Result Spot or CPT",
-        "Duration Factor", "CPS Euro"
-    ]
-    for i in range(min(3, len(df_euro))):
-        debug_logs.append(f"[DEBUG-ROW-{i+1}] ------ MATH PIPELINE ------")
-        for col in cols_to_log:
-            val = df_euro[col].iloc[i] if col in df_euro.columns else "N/A"
-            debug_logs.append(f"[DEBUG-ROW-{i+1}] {col}: {val}")
-
     return df_euro
 
-
 # --- 4. MAIN ORCHESTRATOR ---
-async def process_intl_audit_logic_stream(intl_data, cpm_file, euro_file, upload_folder):
+async def process_intl_audit_logic_stream(intl_data, cpm_file, euro_file, sport_genre, spot_fixture, upload_folder):
     timestamp = int(time.time())
     start_time = time.time()
     work_dir = upload_folder if os.name == 'nt' else "/tmp"
     
-    yield f"data: [LOG] Dual-Engine Active (CPM + EURO). Target Dir: {work_dir}\n\n"
+    sport_genre_safe = str(sport_genre).strip() if sport_genre else "Football"
+    yield f"data: [LOG] Config -> Genre: {sport_genre_safe} | CPT Floor: {spot_fixture}%\n\n"
     
     intl_p = os.path.join(work_dir, f"i_{timestamp}.xlsx")
     cpm_p = os.path.join(work_dir, f"c_{timestamp}.xlsx")
@@ -2955,38 +2939,59 @@ async def process_intl_audit_logic_stream(intl_data, cpm_file, euro_file, upload
         yield f"data: [ERROR] Disk Write Failure: {str(e)}\n\n"
         return
 
-    yield "data: [LOG] Step 2/7: Extracting ALL Reference Tables...\n\n"
+    # --- NEW: EXPLICIT SHEET VALIDATION & LOGGING ---
+    yield "data: [LOG] Step 2/7: Validating Reference Tables...\n\n"
     try:
+        # Validate CPM Tabs
         xl_cpm = pd.ExcelFile(cpm_p, engine='calamine')
-        df_cpt = pd.read_excel(xl_cpm, sheet_name=next((s for s in xl_cpm.sheet_names if "cpt list" in s.lower()), None))
-        core_sheet = next((s for s in xl_cpm.sheet_names if "core data" in s.lower()), None)
-        df_core = pd.read_excel(xl_cpm, sheet_name=core_sheet, header=None) if core_sheet else None
+        cpm_sheet_name = next((s for s in xl_cpm.sheet_names if "cpt list" in s.lower()), None)
+        if not cpm_sheet_name:
+            yield "data: [ERROR] Missing required tab containing 'cpt list' in the CPM Macro File.\n\n"
+            return
+        
+        df_cpt = pd.read_excel(xl_cpm, sheet_name=cpm_sheet_name)
+        if 'Date Updated' in df_cpt.columns:
+            df_cpt['Date Updated_DT'] = pd.to_datetime(df_cpt['Date Updated'], errors='coerce')
+            df_cpt = df_cpt.sort_values('Date Updated_DT').drop_duplicates(subset=['Latest / Old'], keep='last')
+        else:
+            df_cpt = df_cpt.drop_duplicates(subset=['Latest / Old'], keep='last')
         xl_cpm.close()
 
+        # Validate EURO Tabs
         xl_euro = pd.ExcelFile(euro_p, engine='calamine')
+        euro_sheets_present = [s.lower() for s in xl_euro.sheet_names]
+        euro_required_checks = {
+            'country table rates': "Missing! Channel Base Rates will default to 0.",
+            'sport weighting': "Missing! Sport multipliers will default to 1.0.",
+            'audience weighting': "Missing! Audience adjustments will default to 1.0.",
+            'dayparts': "Missing! Prime Time logic may fail.",
+            'weightings': "Missing! Global thresholds (PrimeAdj, LimitDuration) will default."
+        }
+        
+        for kw, warning_msg in euro_required_checks.items():
+            if not any(kw in s for s in euro_sheets_present):
+                yield f"data: [WARNING] Tab '{kw}' {warning_msg}\n\n"
+
         def fetch_sheet(keyword, skip=0, header=0):
             sheet = next((s for s in xl_euro.sheet_names if keyword.lower() in s.lower()), None)
             return pd.read_excel(xl_euro, sheet_name=sheet, skiprows=skip, header=header) if sheet else None
 
-        euro_refs = {}
-        euro_refs['country_table'] = fetch_sheet('country table rates', skip=4) 
-        euro_refs['sport_spot'] = process_ref_table(fetch_sheet('sport weighting', skip=6))
-        euro_refs['aud_weight'] = process_ref_table(fetch_sheet('audience weighting', skip=6))
-        
+        euro_refs = {
+            'country_table': fetch_sheet('country table rates', skip=4),
+            'sport_spot': process_ref_table(fetch_sheet('sport weighting', skip=6)),
+            'aud_weight': process_ref_table(fetch_sheet('audience weighting', skip=6)),
+            'dayparts': fetch_sheet('dayparts', skip=6),
+            'fixtures': fetch_sheet('fixtures', skip=3)
+        }
         sport_cpt_sheet = fetch_sheet('sport weighting cpt', skip=6)
         euro_refs['sport_cpt'] = process_ref_table(sport_cpt_sheet) if sport_cpt_sheet is not None else euro_refs['sport_spot']
-
-        euro_refs['dayparts'] = fetch_sheet('dayparts', skip=6) 
-        euro_refs['fixtures'] = fetch_sheet('fixtures', skip=3)
         
         w_df = fetch_sheet('weightings', header=None) 
         euro_refs['weightings_raw'] = w_df
-        
         extracted_tables = extract_weighting_tables(w_df)
         euro_refs['weight_spot'] = extracted_tables['spot']
         euro_refs['weight_cpt'] = extracted_tables['cpt']
         euro_refs['tbl_repeats'] = extracted_tables['repeats']
-
         xl_euro.close()
     except Exception as e:
         yield f"data: [ERROR] Reference Read Failure: {str(e)}\n\n"
@@ -2996,15 +3001,12 @@ async def process_intl_audit_logic_stream(intl_data, cpm_file, euro_file, upload
     try:
         xl_intl = pd.ExcelFile(intl_p, engine='calamine')
         target_sheet = next((s for s in xl_intl.sheet_names if "rates+ratings" in s.lower()), xl_intl.sheet_names[0])
-        
         temp_df = pd.read_excel(xl_intl, sheet_name=target_sheet, header=None, nrows=15)
         header_idx = 0
         for idx, row in temp_df.iterrows():
-            row_str = " ".join(row.astype(str).str.lower())
-            if 'channel' in row_str and ('country' in row_str or 'programme' in row_str):
+            if 'channel' in " ".join(row.astype(str).str.lower()):
                 header_idx = idx
                 break
-                
         df_intl = pd.read_excel(xl_intl, sheet_name=target_sheet, skiprows=header_idx)
         df_intl.columns = df_intl.columns.astype(str).str.strip()
         xl_intl.close()
@@ -3012,128 +3014,170 @@ async def process_intl_audit_logic_stream(intl_data, cpm_file, euro_file, upload
         yield f"data: [ERROR] Intl Read Failure: {str(e)}\n\n"
         return
 
-    yield "data: [LOG] Step 4/7: Applying V-AF Formatted Mappings...\n\n"
+    yield "data: [LOG] Step 4/7: Applying Mappings & Front-End Overrides...\n\n"
     
+    orig_sport_col = next((c for c in df_intl.columns if str(c).strip().lower() in ['sports', 'sportg', 'sport genre']), None)
+    if orig_sport_col:
+        df_intl['_original_sport'] = df_intl[orig_sport_col]
+    else:
+        df_intl['_original_sport'] = 'football'
+
+    overwritten_tracker = []
+    for col in df_intl.columns:
+        if str(col).strip().lower() in ['sports', 'sportg', 'sport genre']:
+            df_intl[col] = sport_genre_safe 
+            overwritten_tracker.append(col)
+    if not overwritten_tracker:
+        df_intl['sports'] = sport_genre_safe
+
     cpt_countries = df_cpt.iloc[:, 10].astype(str).str.strip().str.lower()
     cpt_country_ids = df_cpt.iloc[:, 8]
     mat_country_dict = dict(zip(cpt_countries, cpt_country_ids))
-
-    cpt_channels = df_cpt.iloc[:, 3].astype(str).str.strip().str.lower()
-    cpt_channel_ids = df_cpt.iloc[:, 9]
-    channel_id_dict = dict(zip(cpt_channels, cpt_channel_ids))
-
+    channel_id_dict = dict(zip(df_cpt.iloc[:, 3].astype(str).str.strip().str.lower(), df_cpt.iloc[:, 9]))
     region_dict = dict(zip(df_cpt.iloc[:, 14].astype(str).str.strip(), df_cpt.iloc[:, 6]))
     broadcaster_dict = dict(zip(df_cpt.iloc[:, 3].astype(str).str.strip(), df_cpt.iloc[:, 12]))
 
-    b_col = df_intl.get('channel country', pd.Series()).astype(str).str.strip()
-    c_col = df_intl.get('channel', pd.Series()).astype(str).str.strip()
-    e_col = df_intl.get('programme category', pd.Series()).astype(str).str.strip()
-    b_dash_c = b_col + " - " + c_col
-
-    df_intl['MAT Country ID'] = b_col.str.lower().map(mat_country_dict)
+    b_col_raw = df_intl.get('channel country', pd.Series()).astype(str).str.strip()
+    b_col = b_col_raw.replace(r'(?i)^Pan-MENA$', 'Pan-Middle East', regex=True)
+    df_intl['channel country'] = b_col
     
-    chan_map_primary = b_dash_c.str.lower().map(channel_id_dict)
-    chan_map_fallback = c_col.str.lower().map(channel_id_dict)
-    df_intl['Channel ID'] = chan_map_primary.fillna(chan_map_fallback)
+    c_col_raw = df_intl.get('channel', pd.Series()).astype(str).str.strip()
+    c_col_spaced = c_col_raw.str.replace(r'(?i)(Sport\s*TV)\s*(\+|[0-9]+)', r'\1 \2', regex=True)
+    c_col_spaced = c_col_spaced.str.replace(r'\s+', ' ', regex=True).str.strip()
+    df_intl['channel'] = c_col_spaced
+    
+    c_col_clean = c_col_spaced.str.split('(').str[0].str.replace(r'(?i)\s*(ARG|MENA|USA|NZL|PAN-AFRICA|AFRICA)$', '', regex=True).str.strip()
+    
+    df_intl['MAT Country ID'] = b_col.str.lower().map(mat_country_dict)
+    chan_map_primary = (b_col + " - " + c_col_spaced).str.lower().map(channel_id_dict)
+    chan_map_secondary = (b_col + " - " + c_col_clean).str.lower().map(channel_id_dict)
+    chan_map_fallback = c_col_spaced.str.lower().map(channel_id_dict)
+    df_intl['Channel ID'] = chan_map_primary.fillna(chan_map_secondary).fillna(chan_map_fallback).fillna(c_col_clean.str.lower().map(channel_id_dict))
 
-    df_intl['Region'] = c_col.map(region_dict)
-    df_intl['Broadcaster'] = b_dash_c.map(broadcaster_dict)
-    df_intl['Day'] = df_intl.get('progr. start (date)', "")
-    df_intl['Program Type'] = e_col 
-
+    df_intl['Region'] = c_col_spaced.map(region_dict)
+    df_intl['Broadcaster'] = (b_col + " - " + c_col_spaced).map(broadcaster_dict)
+    
     m_col = df_intl.get('home team', pd.Series([""]*len(df_intl))).fillna("").astype(str)
     n_col = df_intl.get('away team', pd.Series([""]*len(df_intl))).fillna("").astype(str)
-    df_intl['PhaseFixtureEpisode'] = np.where((m_col != "") | (n_col != ""), m_col + " vs " + n_col, "")
-    df_intl['Vs'] = np.where((m_col == "") & (n_col == ""), "", "vs")
+    df_intl['PhaseFixtureEpisode'] = pd.Series(np.where((m_col != "") | (n_col != ""), m_col + " vs " + n_col, ""), index=df_intl.index)
     
     k_col = df_intl.get('event', pd.Series([""]*len(df_intl))).fillna("").astype(str)
     l_col = df_intl.get('matchday', pd.Series([""]*len(df_intl))).fillna("").astype(str)
-    df_intl['Program title'] = k_col + " " + l_col
+    df_intl['Program title'] = pd.Series(np.where((k_col != "") | (l_col != ""), k_col + " " + l_col, ""), index=df_intl.index).str.strip()
     
-    empty_col = pd.Series([""] * len(df_intl))
-    df_intl['Program description'] = df_intl.get('Column_AA_Name', empty_col) 
+    ad_col = df_intl['Program title']
+    ae_col = df_intl['PhaseFixtureEpisode']
+    df_intl['Combined (translated)'] = pd.Series(
+        np.where((ad_col != "") & (ae_col != ""), ad_col + " - " + ae_col, ad_col + ae_col), 
+        index=df_intl.index
+    ).str.strip()
     
-    ad_col = df_intl['Program title'].astype(str)
-    ae_col = df_intl['PhaseFixtureEpisode'].astype(str)
-    df_intl['Combined (translated)'] = np.where((ad_col != "") | (ae_col != ""), ad_col + " - " + ae_col, "")
-
-    yield "data: [LOG] Step 5/7: Routing Data to CPM & EURO Engines...\n\n"
     target_col_base = '1sec Repucom Rate in EUR'
     matched_cols = [c for c in df_intl.columns if target_col_base.lower() in c.lower()]
+    target_col = matched_cols[0] if matched_cols else target_col_base
     
-    if matched_cols:
-        target_col = matched_cols[0]
-    else:
-        df_intl[target_col_base] = np.nan 
-        target_col = target_col_base
+    # --- STEP 5: SMART ROUTING LOGIC ---
+    yield "data: [LOG] Step 5/7: Applying Model Routing Keys...\n\n"
+    
+    df_intl['Model_Lookup_Key'] = df_intl['channel country'].astype(str) + df_intl['channel'].astype(str)
+    
+    aud_est_col = next((c for c in df_intl.columns if 'estimat' in c.lower() and 'aud' in c.lower()), None)
+    aud_off_col = next((c for c in df_intl.columns if ('official' in c.lower() or 'metered' in c.lower()) and 'aud' in c.lower()), None)
+    
+    def parse_aud(series):
+        return pd.to_numeric(series.astype(str).str.replace(',', '', regex=False).str.replace(' ', '', regex=False), errors='coerce')
         
-    is_empty = df_intl[target_col].isna() | df_intl[target_col].astype(str).str.strip().str.upper().isin(['', 'X', 'NAN'])
+    aud_estimates = parse_aud(df_intl[aud_est_col]) if aud_est_col else pd.Series(np.nan, index=df_intl.index)
+    aud_official = parse_aud(df_intl[aud_off_col]) if aud_off_col else pd.Series(np.nan, index=df_intl.index)
     
-    concat_key = b_col + c_col
-    df_intl['_model_type'] = concat_key.map(HARDCODED_MODEL_MAP).fillna('CPM')
+    df_intl['Aud Metered'] = aud_official
+    df_intl['Final_Aud_Check'] = aud_official.fillna(aud_estimates).fillna(0.0)
+
+    def route_model(row):
+        key = row['Model_Lookup_Key']
+        mkt, chan = str(row['channel country']).strip().upper(), str(row['channel']).strip().upper()
+        
+        if key in HARDCODED_MODEL_MAP:
+            return HARDCODED_MODEL_MAP[key]
+        if mkt in [m.upper() for m in FORCE_EURO_MARKETS]:
+            return "EURO"
+        if chan in [c.upper() for c in FORCE_EURO_CHANNELS]:
+            return "EURO"
+        return "CPM"
+
+    df_intl['_model_type'] = df_intl.apply(route_model, axis=1)
     
+    # --- STEP 6: EXECUTING CALCULATIONS ---
     yield "data: [LOG] Step 6/7: Executing Calculations...\n\n"
     debug_logs = []
     try:
-        cpm_mask = (df_intl['_model_type'] == 'CPM') & is_empty
+        # --- THE FIX: Convert column to object to prevent Pandas dtype warnings ---
+        if target_col in df_intl.columns:
+            df_intl[target_col] = df_intl[target_col].astype(object)
+            
+        # -- 6a: CPM ENGINE --
+        cpm_mask = (df_intl['_model_type'] == 'CPM') 
         df_cpm_raw = df_intl[cpm_mask].copy()
         
-        euro_mask = (df_intl['_model_type'] == 'EURO') & is_empty
-        df_euro_raw = df_intl[euro_mask].copy()
-        
-        yield f"data: [DEBUG] Total Missing Rates -> CPM Route: {len(df_cpm_raw)} | EURO Route: {len(df_euro_raw)}\n\n"
-        
         if not df_cpm_raw.empty:
-            aud_est_col = next((c for c in df_cpm_raw.columns if 'estimat' in c.lower() and 'aud' in c.lower()), None)
-            aud_off_col = next((c for c in df_cpm_raw.columns if ('official' in c.lower() or 'metered' in c.lower()) and 'aud' in c.lower()), None)
-            
-            def parse_aud(series):
-                clean_series = series.astype(str).str.replace(',', '', regex=False).str.replace(' ', '', regex=False)
-                return pd.to_numeric(clean_series, errors='coerce')
-                
-            aud_estimates = parse_aud(df_cpm_raw[aud_est_col]) if aud_est_col else pd.Series(np.nan, index=df_cpm_raw.index)
-            aud_official = parse_aud(df_cpm_raw[aud_off_col]) if aud_off_col else pd.Series(np.nan, index=df_cpm_raw.index)
-            
-            final_aud = aud_estimates.fillna(aud_official).fillna(0.0)
-            df_cpm_raw['Final_Audience'] = (final_aud * 1000).round() / 1000
-
+            df_cpm_raw['Final_Audience'] = (df_cpm_raw['Final_Aud_Check'] * 1000).round() / 1000
             mat_id = df_cpm_raw['MAT Country ID'].astype(str).str.replace(r'\.0$', '', regex=True).str.replace('nan', '0', case=False)
             chan_id = df_cpm_raw['Channel ID'].astype(str).str.replace(r'\.0$', '', regex=True).str.replace('nan', '0', case=False)
             
             df_cpm_raw['lookup_key'] = mat_id + "-" + chan_id + " - Latest"
-            merged = pd.merge(df_cpm_raw, df_cpt[['Latest / Old', 'Channel CPM in € per 30 sec.']], left_on='lookup_key', right_on='Latest / Old', how='left')
+            cpm_dict = df_cpt.set_index('Latest / Old')['Channel CPM in € per 30 sec.'].to_dict()
+            df_cpm_raw['Matched_CPM'] = pd.to_numeric(df_cpm_raw['lookup_key'].map(cpm_dict), errors='coerce').fillna(0.0)
             
-            df_cpm_raw['Matched_CPM'] = pd.to_numeric(merged['Channel CPM in € per 30 sec.'], errors='coerce').fillna(0.0)
+            missing_aud_mask = (df_cpm_raw['Final_Aud_Check'] <= 0)
+            no_aud_indices = df_cpm_raw[missing_aud_mask].index
+            if not no_aud_indices.empty:
+                df_intl.loc[no_aud_indices, target_col] = "Audience required to calculate rates"
+                
+                # --- NEW: User-Friendly Missing Audience Log ---
+                yield f"data: ℹ️ MISSING AUDIENCE: Found {len(no_aud_indices)} CPM row(s) with blank audience fields. These were safely flagged in the output file.\n\n"
             
-            calc_rate = (df_cpm_raw['Final_Audience'] * df_cpm_raw['Matched_CPM']) / 30
-            
-            df_cpm_raw['Calculated_1sec_Rate'] = np.where(
-                (df_cpm_raw['Matched_CPM'] == 0.0) | (df_cpm_raw['lookup_key'] == '0-0 - Latest'),
-                "Not Found in CPT Ref",
-                calc_rate
-            )
-            
-            df_intl.loc[df_cpm_raw.index, target_col] = df_cpm_raw['Calculated_1sec_Rate']
-            
+            failed_cpm_mask = (df_cpm_raw['Matched_CPM'] == 0.0) | (df_cpm_raw['lookup_key'] == '0-0 - Latest')
+            fallback_mask = failed_cpm_mask & ~missing_aud_mask
+            fallback_indices = df_cpm_raw[fallback_mask].index
+            if not fallback_indices.empty:
+                df_intl.loc[fallback_indices, '_model_type'] = 'EURO'
+                
+                # --- NEW: User-Friendly CPM Failover Log ---
+                fallback_chans = df_cpm_raw.loc[fallback_indices, 'channel'].dropna().unique()
+                chan_list = ', '.join(sorted(fallback_chans))
+                yield f"data: 🔄 REROUTED TO EURO: {len(fallback_indices)} row(s) for channels [{chan_list}] had no valid CPM rate in your 'cpt list'. We safely shifted them to the Euro Ratecard to prevent €0.00 outputs.\n\n"
+                
+            success_mask = ~missing_aud_mask & ~failed_cpm_mask
+            success_cpm = df_cpm_raw[success_mask].copy()
+            if not success_cpm.empty:
+                success_cpm['Calculated_1sec_Rate'] = (success_cpm['Final_Audience'] * success_cpm['Matched_CPM']) / 30
+                df_intl.loc[success_cpm.index, target_col] = success_cpm['Calculated_1sec_Rate']
+        
+        # -- 6b: EURO ENGINE --
+        euro_mask = (df_intl['_model_type'] == 'EURO')
+        df_euro_raw = df_intl[euro_mask].copy()
+        
         if not df_euro_raw.empty:
-            df_euro_calc = simulate_euro_macro_calculation(df_euro_raw, euro_refs, debug_logs)
+            df_euro_calc = simulate_euro_macro_calculation(df_euro_raw, euro_refs, sport_genre_safe, spot_fixture, debug_logs)
             df_intl.loc[df_euro_calc.index, target_col] = df_euro_calc['CPS Euro']
             
-        for log in debug_logs: yield f"data: {log}\n\n"
+            for log in debug_logs:
+                yield f"data: {log}\n\n"
+            
         gc.collect()
     except Exception as e:
         yield f"data: [ERROR] Calculation Failed: {str(e)}\n\n"
         return
 
+    # --- STEP 7: OUTPUT & CLEANUP ---
     yield "data: [LOG] Step 7/7: Generating output Excel buffer...\n\n"
     
-    # THE FIX: Instead of dropping the internal tracking column, rename it to a clean header!
     if '_model_type' in df_intl.columns: 
         df_intl = df_intl.rename(columns={'_model_type': 'Applied Engine'})
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df_intl.to_excel(writer, sheet_name='Calculated Export', index=False)
+        df_intl.drop(columns=['Final_Aud_Check', 'Aud Metered', '_original_sport'], errors='ignore').to_excel(writer, sheet_name='Calculated Export', index=False)
     
     del df_intl, df_cpt, euro_refs
     gc.collect()

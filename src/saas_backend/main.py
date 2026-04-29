@@ -30,6 +30,11 @@ origins = [
             
     # You can also add the pattern for all vercel subdomains if your deployment URL changes often:
     # "https://*.vercel.app", 
+    # ⬇️ ADD YOUR NEW OKTA/PRODUCTION DOMAINS HERE ⬇️
+    "https://sportsautomation.nlsn.media",
+    "https://sportsautomation.nlsn.media/",
+    # If your backend is accessed via the ALB URL directly, add that too just in case:
+    "http://automationportal-app-np-1996887397.ap-south-1.elb.amazonaws.com"
 ]
 master_app.add_middleware(
     CORSMiddleware,
@@ -41,6 +46,12 @@ master_app.add_middleware(
 )
 
 # --- ROUTING/MOUNTING ---
+
+# 🚨 AWS HEALTH CHECK ROUTE 🚨
+@master_app.get("/")
+async def health_check():
+    """AWS Target Group Health Check Endpoint to stop container terminations"""
+    return {"status": "healthy", "message": "Backend is running!"}
     
 # 1. Mount the QC API as a sub-application (Example path: /qc/api/run_qc)
 # If you prefer the old path structure, you might need to adjust prefixes in qc_api.py

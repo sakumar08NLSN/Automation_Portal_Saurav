@@ -4,5 +4,5 @@ if [ "$APP_MODE" = "dev" ]; then
 else
     echo "🚀 Starting FastAPI in production mode"
     # We add 600 seconds (10 minutes)
-    exec uvicorn main:master_app --host 0.0.0.0 --port 8000 --timeout-keep-alive 600
+    exec uvicorn main:master_app --host 0.0.0.0 --port 8000 --timeout-keep-alive 600 --proxy-headers --forwarded-allow-ips="*"
 fi

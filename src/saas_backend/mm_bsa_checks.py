@@ -1,5 +1,6 @@
 import pandas as pd
 
+
 def extract_general_info_entities(general_df):
 
     events = set()
@@ -368,25 +369,17 @@ def fixture_validation_check(df, fixture_df):
     df.columns = df.columns.str.strip()
     fixture_df.columns = fixture_df.columns.str.strip()
 
-    required_cols = [
-        "event",
-        "matchday",
-        "matchday date",
-        "match"
-    ]
+    required_cols = ["event", "matchday", "matchday date", "match"]
 
-    optional_col = "competition"
     for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"Missing column in Adapt file: {col}")
-        if col not in fixture_df.columns:
-            raise ValueError(f"Missing column in Fixture file: {col}")
+        if col not in df.columns or col not in fixture_df.columns:
+            raise ValueError(f"Missing column: {col}")
 
-    for col in required_cols + [optional_col]:
+    for col in required_cols + ["competition"]:
         if col in df.columns:
-            df[col] = df[col].astype(str).str.strip().str.lower()
+            df[col] = df[col].astype(str).str.lower().str.strip()
         if col in fixture_df.columns:
-            fixture_df[col] = fixture_df[col].astype(str).str.strip().str.lower()
+            fixture_df[col] = fixture_df[col].astype(str).str.lower().str.strip()
 
     fixture_set = set()
 
@@ -395,37 +388,31 @@ def fixture_validation_check(df, fixture_df):
             row["event"],
             row["matchday"],
             row["matchday date"],
-            row["match"],
-            row.get("competition", "")
+            row["match"]
         )
         fixture_set.add(key)
 
-    results = []
+    flags = []
+    remarks = []
 
     for _, row in df.iterrows():
 
-        key_with_comp = (
+        key = (
             row["event"],
             row["matchday"],
             row["matchday date"],
-            row["match"],
-            row.get("competition", "")
+            row["match"]
         )
 
-        key_without_comp = (
-            row["event"],
-            row["matchday"],
-            row["matchday date"],
-            row["match"],
-            ""
-        )
-
-        if key_with_comp in fixture_set or key_without_comp in fixture_set:
-            results.append("TRUE")
+        if key in fixture_set:
+            flags.append(True)
+            remarks.append("")
         else:
-            results.append("FALSE")
+            flags.append(False)
+            remarks.append("Match/Event not found in Fixture file")
 
-    df["fixture_validation"] = results
+    df["Fixture_Validation_Flag"] = flags
+    df["Fixture_Validation_Remark"] = remarks
 
     return df
 
@@ -588,10 +575,8 @@ def event_quality_check(df):
 
 def home_market_check(df):
 
-    # ----------------------------
-    # CLEAN COLUMN NAMES
-    # ----------------------------
-    df.columns = df.columns.str.strip()
+    df = df.copy()
+    df.columns = df.columns.str.strip().str.lower()
 
     required_cols = [
         "match",
@@ -615,12 +600,17 @@ def home_market_check(df):
     df["channel country"] = df["channel country"].astype(str).str.strip().str.lower()
 
     # ----------------------------
-    # FILTER LIVE + DELAYED DATA
+    # FILTER LIVE + DELAYED
     # ----------------------------
     live_df = df[df["programme category"].str.contains("live|delayed", na=False)].copy()
 
     # ----------------------------
-    # BUILD MATCH → CHANNEL COUNTRIES MAP
+    # ALL MARKETS COVERED IN MM
+    # ----------------------------
+    all_markets_in_mm = set(df["channel country"].dropna().unique())
+
+    # ----------------------------
+    # MATCH → AVAILABLE MARKETS
     # ----------------------------
     match_market_map = (
         live_df.groupby("match")["channel country"]
@@ -629,54 +619,64 @@ def home_market_check(df):
     )
 
     # ----------------------------
-    # BUILD MATCH → HOME COUNTRY MAP
+    # MATCH → HOME COUNTRY
     # ----------------------------
     home_country_map = {}
 
     for _, row in live_df.iterrows():
         if row["home/away"] == "home":
-            match = row["match"]
-            home_country_map[match] = row["country"]
+            home_country_map[row["match"]] = row["country"]
 
     # ----------------------------
-    # APPLY CHECK
+    # VALIDATION
     # ----------------------------
-    flag = []
-    remark = []
+    flags = []
+    remarks = []
 
     for _, row in df.iterrows():
 
         category = row["programme category"]
 
-        # Skip non live/delayed
+        # Skip non-live/delayed
         if not ("live" in category or "delayed" in category):
-            flag.append("TRUE")
-            remark.append("")
+            flags.append(True)
+            remarks.append("")
             continue
 
         match = row["match"]
 
-        # If no home info → skip safely
         if match not in home_country_map:
-            flag.append("TRUE")
-            remark.append("")
+            flags.append(True)
+            remarks.append("")
             continue
 
         home_country = home_country_map[match]
         available_markets = match_market_map.get(match, set())
 
-        if home_country not in available_markets:
-            flag.append("FALSE")
-            remark.append(f"Missing home market broadcast: {home_country}")
-        else:
-            flag.append("TRUE")
-            remark.append("")
+        # ----------------------------
+        # CASE 1: Home market present
+        # ----------------------------
+        if home_country in available_markets:
+            flags.append(True)
+            remarks.append("")
+            continue
 
-    # ----------------------------
-    # ADD OUTPUT
-    # ----------------------------
-    df["home_market_flag"] = flag
-    df["home_market_remark"] = remark
+        # ----------------------------
+        # CASE 2: Market NOT in MM → OK
+        # ----------------------------
+        if home_country not in all_markets_in_mm:
+            flags.append(True)
+            remarks.append(f"{home_country} not covered in MM (allowed)")
+            continue
+
+        # ----------------------------
+        # CASE 3: REAL ISSUE
+        # ----------------------------
+        flags.append(False)
+        remarks.append(f"Missing home market broadcast: {home_country}")
+
+    df["home_market_flag"] = flags
+    df["home_market_remark"] = remarks
 
     return df
 
@@ -815,133 +815,95 @@ def channel_country_mapping_check(df, rosco_path):
 
     return df
 
-def mm_bsr_consistency_check(mm_df, bsr_df):
-    # -----------------------------------
-    # CLEAN COLUMN NAMES
-    # -----------------------------------
-    mm_df.columns = mm_df.columns.str.strip().str.lower()
-    bsr_df.columns = bsr_df.columns.str.strip().str.lower()
+def mm_bsr_consistency_check(mm_df, bsr_input):
 
-    # -----------------------------------
-    # 🔁 COLUMN MAPPING (CRITICAL)
-    # -----------------------------------
-    mm_map = {"event": "event", "matchday": "matchday", "competition": "competition", "match": "match"}
-    bsr_map = {
-        "event": "event", 
-        "matchday": "matchday", 
-        "competition": "competition", 
-        "home": "home team", # Lowercase!
-        "away": "away team"  # Lowercase!
-    }
+    print(" FINAL MM BSR FUNCTION RUNNING")
 
-    if bsr_map["home"] not in bsr_df.columns:
-        # Debugging: this will print exactly what columns Pandas DOES see
-        print(f"DEBUG: Actual BSR Columns found: {list(bsr_df.columns)}")
-        raise KeyError(f"Could not find column 'Home Team'. Available: {list(bsr_df.columns)}")
+    try:
+        # LOAD BSR
+        if isinstance(bsr_input, str):
+            bsr_df = pd.read_excel(bsr_input)
+        else:
+            bsr_df = bsr_input.copy()
 
-    # -----------------------------------
-    # 🧠 CREATE MATCH COLUMN IN BSR
-    # -----------------------------------
-    bsr_df["match"] = (
-        bsr_df[bsr_map["home"]].astype(str).str.strip()
-        + " vs " +
-        bsr_df[bsr_map["away"]].astype(str).str.strip()
-    )
+        # CLEAN
+        mm_df = mm_df.copy()
+        mm_df.columns = mm_df.columns.str.strip().str.lower()
+        bsr_df.columns = bsr_df.columns.str.strip().str.lower()
 
-    # -----------------------------------
-    # 🧼 STANDARDIZE TEXT
-    # -----------------------------------
-    def clean(col):
-        return col.astype(str).str.lower().str.strip()
+        # CREATE MATCH
+        if "home team" in bsr_df.columns and "away team" in bsr_df.columns:
+            bsr_df["match"] = (
+                bsr_df["home team"].astype(str).str.strip()
+                + " vs " +
+                bsr_df["away team"].astype(str).str.strip()
+            )
 
-    for col in ["event", "matchday", "competition", "match"]:
-        mm_df[col] = clean(mm_df[mm_map[col]])
-        bsr_df[col] = clean(bsr_df[bsr_map.get(col, col)])
+        # CLEAN TEXT
+        def clean(col):
+            return col.astype(str).str.lower().str.strip()
 
-    # -----------------------------------
-    # 🔑 CREATE MATCH KEY
-    # -----------------------------------
-    mm_df["key"] = (
-        mm_df["event"] + "|" +
-        mm_df["matchday"] + "|" +
-        mm_df["match"]
-    )
+        for col in ["event", "matchday", "competition", "match"]:
+            mm_df[col] = clean(mm_df[col])
+            bsr_df[col] = clean(bsr_df[col])
 
-    bsr_df["key"] = (
-        bsr_df["event"] + "|" +
-        bsr_df["matchday"] + "|" +
-        bsr_df["match"]
-    )
+        # CREATE KEY
+        mm_df["_key"] = mm_df["event"] + "|" + mm_df["matchday"] + "|" + mm_df["match"]
+        bsr_df["_key"] = bsr_df["event"] + "|" + bsr_df["matchday"] + "|" + bsr_df["match"]
 
-    # -----------------------------------
-    # INIT FLAG
-    # -----------------------------------
-    mm_df["MM_BSR_Flag"] = "OK"
+        # MAP
+        bsr_map = bsr_df.set_index("_key")
 
-    # -----------------------------------
-    # 1️⃣ MATCH EXISTENCE CHECK
-    # -----------------------------------
-    missing_mask = ~mm_df["key"].isin(bsr_df["key"])
-    mm_df.loc[missing_mask, "MM_BSR_Flag"] = "Missing in BSR"
+        flags = []
+        remarks = []
 
-    # -----------------------------------
-    # 2️⃣ FIELD CONSISTENCY CHECK
-    # -----------------------------------
-    merged = mm_df.merge(
-        bsr_df[["key", "competition"]],
-        on="key",
-        how="left",
-        suffixes=("", "_bsr")
-    )
+        for _, row in mm_df.iterrows():
 
-    mismatch_mask = (
-        (merged["competition"] != merged["competition_bsr"]) &
-        (~merged["competition_bsr"].isna())
-    )
+            key = row["_key"]
 
-    mm_df.loc[mismatch_mask, "MM_BSR_Flag"] = "Mismatch with BSR"
+            # ❌ Case 1: Missing match
+            if key not in bsr_map.index:
+                flags.append(False)
+                remarks.append("Match not found in BSR file")
+                continue
 
-    # -----------------------------------
-    # 3️⃣ DUPLICATE CHECK (MM vs BSR)
-    # -----------------------------------
-    dup_keys = set(mm_df["key"]).intersection(set(bsr_df["key"]))
+            bsr_row = bsr_map.loc[key]
 
-    mm_df.loc[mm_df["key"].isin(dup_keys), "MM_BSR_Flag"] = "Duplicate in MM & BSR"
+            # ❌ Case 2: Competition mismatch
+            mm_comp = str(row.get("competition", "")).strip()
+            bsr_comp = str(bsr_row.get("competition", "")).strip()
 
-    # -----------------------------------
-    # 4️⃣ INTERNAL CONSISTENCY (MM)
-    # -----------------------------------
-    grp = mm_df.groupby("event")
+            if mm_comp != bsr_comp:
+                flags.append(False)
+                remarks.append(
+                    f"Competition mismatch → MM: {mm_comp} | BSR: {bsr_comp}"
+                )
+                continue
 
-    for event, group in grp:
-        if group["competition"].nunique() > 1:
-            mm_df.loc[group.index, "MM_BSR_Flag"] = "Inconsistent competition in MM"
+            # ✅ Case 3: All good
+            flags.append(True)
+            remarks.append("")
 
-    # -----------------------------------
-    # 5️⃣ TEAM CONSISTENCY
-    # -----------------------------------
-    def extract_teams(match):
-        parts = str(match).split("vs")
-        return [p.strip() for p in parts] if len(parts) == 2 else []
+        # FINAL OUTPUT
+        mm_df["MM_BSR_Flag"] = flags
+        mm_df["MM_BSR_Remark"] = remarks
 
-    team_events = {}
+        # REMOVE INTERNAL COLUMNS
+        for col in ["_key", "key"]:
+            if col in mm_df.columns:
+                mm_df.drop(columns=[col], inplace=True)
 
-    for _, row in mm_df.iterrows():
-        teams = extract_teams(row["match"])
+        return mm_df
 
-        for t in teams:
-            t = t.lower()
-            team_events.setdefault(t, set()).add(row["event"])
-
-    for team, events in team_events.items():
-        if len(events) > 1:
-            mask = mm_df["match"].str.contains(team, case=False, na=False)
-            mm_df.loc[mask, "MM_BSR_Flag"] = "Team inconsistent across events"
-
-    mm_df["MM_BSR_Remark"] = mm_df["MM_BSR_Flag"]
-    return mm_df
+    except Exception as e:
+        print("❌ ERROR:", str(e))
+        mm_df["MM_BSR_Flag"] = False
+        mm_df["MM_BSR_Remark"] = str(e)
+        return mm_df
 
 def audience_spot_range_clean_view(df):
+
+    print("🔍 NEW Audience Range Logic Running")
 
     df.columns = df.columns.str.strip()
 
@@ -956,19 +918,20 @@ def audience_spot_range_clean_view(df):
 
     for (category, channel), group in grouped:
 
+        print(f"Processing: {category} | {channel}")
+
         group = group.copy()
 
         group[audience_col] = pd.to_numeric(group[audience_col], errors="coerce")
         group[spot_col] = pd.to_numeric(group[spot_col], errors="coerce")
 
-        group = group.sort_values(by=audience_col)
-
         median_val = group[audience_col].median()
 
-        # Business-friendly range
-        upper = median_val * 3
+        if pd.isna(median_val) or median_val == 0:
+            continue
 
-        first_row = True
+        lower = median_val * 0.5
+        upper = median_val * 1.5
 
         for _, row in group.iterrows():
 
@@ -978,20 +941,33 @@ def audience_spot_range_clean_view(df):
             remark = ""
 
             if pd.notna(val):
+
+                # ✅ convert to viewers
+                audience_viewers = int(val * 1_000_000)
+
                 if val > upper:
                     flag = False
-                    remark = "Higher than typical audience for this channel"
+                    remark = "Audience > 50% above expected range"
+
+                elif val < lower:
+                    flag = False
+                    remark = "Audience > 50% below expected range"
+
+            else:
+                audience_viewers = None
+                flag = False
+                remark = "Audience missing"
 
             output.append({
-                "Programme Category": category if first_row else "",
-                "Channel": channel if first_row else "",
-                "Audience (in mio)": val,
+                "Programme Category": category,
+                "Channel": channel,
+                "Audience (viewers)": audience_viewers,
                 "Spot Price": row[spot_col],
                 "Flag": flag,
                 "Remark": remark
             })
 
-            first_row = False
+    print("✅ NEW LOGIC APPLIED")
 
     return pd.DataFrame(output)
 
@@ -1023,22 +999,31 @@ def ea_creation_check(df):
 
 def previous_delivery_check(current_df, prev_df):
 
+    # -----------------------------------
+    # CLEAN COLUMN NAMES
+    # -----------------------------------
     current_df.columns = current_df.columns.str.strip().str.lower()
     prev_df.columns = prev_df.columns.str.strip().str.lower()
 
-    # Required columns
-    cols = ["programme category", "channel", "audience (in mio)", "spot price"]
+    required_cols = ["programme category", "channel", "audience (in mio)", "spot price"]
 
-    for col in cols:
+    for col in required_cols:
         if col not in current_df.columns or col not in prev_df.columns:
             raise ValueError(f"Missing column: {col}")
 
-    # Clean numeric
+    # -----------------------------------
+    # CONVERT NUMERIC + FIX UNITS
+    # -----------------------------------
     for df in [current_df, prev_df]:
         df["audience (in mio)"] = pd.to_numeric(df["audience (in mio)"], errors="coerce")
         df["spot price"] = pd.to_numeric(df["spot price"], errors="coerce")
 
-    # Group
+        # Convert to actual numbers
+        df["audience"] = df["audience (in mio)"] * 1_000_000
+
+    # -----------------------------------
+    # GROUP DATA
+    # -----------------------------------
     curr_grp = current_df.groupby(["programme category", "channel"])
     prev_grp = prev_df.groupby(["programme category", "channel"])
 
@@ -1048,65 +1033,193 @@ def previous_delivery_check(current_df, prev_df):
 
         category, channel = key
 
-        curr_median_aud = curr_group["audience (in mio)"].median()
-        curr_median_sp = curr_group["spot price"].median()
+        # ---------------- CURRENT VALUES ----------------
+        curr_aud = curr_group["audience"]
+        curr_sp = curr_group["spot price"]
 
+        curr_med_aud = curr_aud.median()
+        curr_med_sp = curr_sp.median()
+
+        # ---------------- PREVIOUS VALUES ----------------
         if key in prev_grp.groups:
+
             prev_group = prev_grp.get_group(key)
 
-            prev_median_aud = prev_group["audience (in mio)"].median()
-            prev_median_sp = prev_group["spot price"].median()
+            prev_aud = prev_group["audience"]
+            prev_sp = prev_group["spot price"]
+
+            prev_min_aud = prev_aud.min()
+            prev_max_aud = prev_aud.max()
+            prev_med_aud = prev_aud.median()
+
+            prev_min_sp = prev_sp.min()
+            prev_max_sp = prev_sp.max()
+            prev_med_sp = prev_sp.median()
+
         else:
-            prev_median_aud = None
-            prev_median_sp = None
+            prev_min_aud = prev_max_aud = prev_med_aud = None
+            prev_min_sp = prev_max_sp = prev_med_sp = None
 
-        # --------- DEVIATION ---------
-        def calc_dev(curr, prev):
-            if pd.isna(curr) or pd.isna(prev) or prev == 0:
-                return None
-            return (curr - prev) / prev
+        # -----------------------------------
+        # DEFINE RANGE (CORRECT LOGIC)
+        # -----------------------------------
+        def get_range(min_val, max_val):
+            if pd.isna(min_val) or pd.isna(max_val):
+                return None, None
+            return min_val * 0.5, max_val * 1.5
 
-        aud_dev = calc_dev(curr_median_aud, prev_median_aud)
-        sp_dev = calc_dev(curr_median_sp, prev_median_sp)
+        aud_lower, aud_upper = get_range(prev_min_aud, prev_max_aud)
+        sp_lower, sp_upper = get_range(prev_min_sp, prev_max_sp)
 
+        # -----------------------------------
+        # CHECK LOGIC
+        # -----------------------------------
         flag = True
-        remark = ""
+        remarks = []
 
-        # ---------- RULES ----------
-        def check_dev(dev, label):
-            if dev is None:
-                return None
+        # Audience check
+        if aud_lower is not None and aud_upper is not None:
+            if not (aud_lower <= curr_med_aud <= aud_upper):
+                flag = False
+                remarks.append(
+                    f"Audience out of range (Current: {curr_med_aud:.0f}, Expected: {aud_lower:.0f}-{aud_upper:.0f})"
+                )
 
-            if abs(dev) > 1:
-                return f"{label} deviation >100%"
-            elif abs(dev) > 0.5:
-                return f"{label} deviation >50%"
-            return None
+        # Spot price check
+        if sp_lower is not None and sp_upper is not None:
+            if not (sp_lower <= curr_med_sp <= sp_upper):
+                flag = False
+                remarks.append(
+                    f"Spot Price out of range (Current: {curr_med_sp:.0f}, Expected: {sp_lower:.0f}-{sp_upper:.0f})"
+                )
 
-        issues = []
+        remark = " | ".join(remarks) if remarks else ""
 
-        aud_issue = check_dev(aud_dev, "Audience")
-        sp_issue = check_dev(sp_dev, "Spot Price")
-
-        if aud_issue:
-            issues.append(aud_issue)
-
-        if sp_issue:
-            issues.append(sp_issue)
-
-        if issues:
-            flag = False
-            remark = " | ".join(issues)
-
+        # -----------------------------------
+        # OUTPUT
+        # -----------------------------------
         output.append({
             "Programme Category": category,
             "Channel": channel,
-            "Current Audience Median": curr_median_aud,
-            "Previous Audience Median": prev_median_aud,
-            "Current Spot Price Median": curr_median_sp,
-            "Previous Spot Price Median": prev_median_sp,
+
+            "Current Audience Median": round(curr_med_aud, 0) if pd.notna(curr_med_aud) else None,
+            "Previous Audience Median": round(prev_med_aud, 0) if prev_med_aud else None,
+
+            "Current Spot Price Median": round(curr_med_sp, 0) if pd.notna(curr_med_sp) else None,
+            "Previous Spot Price Median": round(prev_med_sp, 0) if prev_med_sp else None,
+
+            "Audience Range": f"{round(aud_lower,0)} - {round(aud_upper,0)}" if aud_lower else "",
+            "Spot Price Range": f"{round(sp_lower,0)} - {round(sp_upper,0)}" if sp_lower else "",
+
             "Flag": flag,
             "Remark": remark
         })
 
     return pd.DataFrame(output)
+
+def live_delayed_check(df):
+
+    df = df.copy()
+    df.columns = df.columns.str.strip().str.lower()
+
+    required_cols = ["programme category", "match", "bt"]
+
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing column: {col}")
+
+    flags = []
+    remarks = []
+
+    for _, row in df.iterrows():
+
+        category = str(row.get("programme category", "")).lower()
+        match = str(row.get("match", "")).strip()
+        bt = row.get("bt")
+
+        # Only apply for live / delayed
+        if not ("live" in category or "delayed" in category):
+            flags.append(True)
+            remarks.append("")
+            continue
+
+        issues = []
+
+        # Missing match
+        if match == "" or match.lower() == "nan":
+            issues.append("Match missing for live/delayed entry")
+
+        # Invalid category
+        if not any(x in category for x in ["live", "delayed"]):
+            issues.append(f"Invalid category for live/delayed: {category}")
+
+        # BT check (basic threshold 90 mins)
+        try:
+            bt_val = float(bt)
+            if bt_val < 90:
+                issues.append("BT too low for live/delayed (expected ≥ 90 mins)")
+        except:
+            issues.append("Invalid BT value")
+
+        # Final decision
+        if issues:
+            flags.append(False)
+            remarks.append(" | ".join(issues))
+        else:
+            flags.append(True)
+            remarks.append("")
+
+    df["Live_Delayed_Check_Flag"] = flags
+    df["Live_Delayed_Check_Remark"] = remarks
+
+    return df
+
+def program_analysis_status_check(df):
+
+    df = df.copy()
+    df.columns = df.columns.str.strip().str.lower()
+
+    # Possible column names (handle variations)
+    possible_cols = [
+        "analysis status",
+        "status",
+        "mm status",
+        "child analysis status"
+    ]
+
+    status_col = None
+    for col in possible_cols:
+        if col in df.columns:
+            status_col = col
+            break
+
+    if not status_col:
+        raise ValueError("No status column found for Program Analysis Status Check")
+
+    flags = []
+    remarks = []
+
+    for _, row in df.iterrows():
+
+        status = str(row.get(status_col, "")).strip().lower()
+
+        if status == "done":
+            flags.append(True)
+            remarks.append("")
+
+        elif status == "ready":
+            flags.append(False)
+            remarks.append("Status is READY (should be moved to DONE)")
+
+        elif status == "" or status == "nan":
+            flags.append(False)
+            remarks.append("Status missing")
+
+        else:
+            flags.append(False)
+            remarks.append(f"Invalid status: {status}")
+
+    df["Program_Status_Flag"] = flags
+    df["Program_Status_Remark"] = remarks
+
+    return df
